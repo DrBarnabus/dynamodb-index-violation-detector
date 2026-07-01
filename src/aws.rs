@@ -11,10 +11,14 @@ use std::fmt;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{AttributeValue as SdkAttributeValue, ReturnConsumedCapacity};
+use aws_sdk_dynamodb::types::{
+    AttributeValue as SdkAttributeValue, BillingMode, KeySchemaElement as SdkKeySchemaElement,
+    KeyType, ReturnConsumedCapacity, ScalarAttributeType, TableDescription as SdkTableDescription,
+    TimeToLiveStatus,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{AttributeValue, Item, KeySchemaElement};
+use crate::domain::{AttributeValue, Item, KeySchemaElement, TypeCode};
 
 /// A table's schema as discovered via `DescribeTable` (PRD §8.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,6 +194,36 @@ impl RealDynamoClient {
     pub fn from_client(client: aws_sdk_dynamodb::Client) -> Self {
         Self { client }
     }
+
+    /// Discovers the TTL attribute via `DescribeTimeToLive` (a separate API from
+    /// `DescribeTable`). Degrades to `None` when the caller lacks
+    /// `dynamodb:DescribeTimeToLive`, so a missing permission never blocks the
+    /// rest of schema discovery.
+    async fn describe_ttl(&self, name: &str) -> Result<Option<TtlDescription>, AwsError> {
+        let out = match self
+            .client
+            .describe_time_to_live()
+            .table_name(name)
+            .send()
+            .await
+        {
+            Ok(out) => out,
+            Err(err) => {
+                let mapped = map_sdk_error(err);
+                if mapped.kind == AwsErrorKind::AccessDenied {
+                    return Ok(None);
+                }
+
+                return Err(mapped);
+            }
+        };
+
+        Ok(out.time_to_live_description.and_then(|desc| {
+            let enabled = matches!(desc.time_to_live_status, Some(TimeToLiveStatus::Enabled));
+            desc.attribute_name
+                .map(|attribute| TtlDescription { attribute, enabled })
+        }))
+    }
 }
 
 #[async_trait]
@@ -215,12 +249,19 @@ impl DynamoClient for RealDynamoClient {
         Ok(names)
     }
 
-    async fn describe_table(&self, _name: &str) -> Result<TableDescription, AwsError> {
-        Err(AwsError {
-            code: "NotImplemented".to_string(),
-            message: "DescribeTable schema discovery is delivered by task #13".to_string(),
-            kind: AwsErrorKind::Other,
-        })
+    async fn describe_table(&self, name: &str) -> Result<TableDescription, AwsError> {
+        let out = self
+            .client
+            .describe_table()
+            .table_name(name)
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
+        let table = out
+            .table
+            .ok_or_else(|| malformed(format!("DescribeTable returned no table for `{name}`")))?;
+        let ttl = self.describe_ttl(name).await?;
+        map_table_description(table, ttl)
     }
 
     async fn scan_segment(&self, req: ScanRequest) -> Result<ScanResponse, AwsError> {
@@ -353,6 +394,139 @@ fn classify_code(code: &str) -> AwsErrorKind {
         | "ThrottlingException"
         | "RequestLimitExceeded" => AwsErrorKind::Throttling,
         _ => AwsErrorKind::Other,
+    }
+}
+
+/// Maps a raw `DescribeTable` result (plus separately-fetched TTL) into the
+/// crate's [`TableDescription`] (PRD §6.3.3): index key schemas resolved to
+/// scalar type codes, provisioned RCU snapshotted (`None` for on-demand) and
+/// the approximate item count for progress estimation.
+fn map_table_description(
+    table: SdkTableDescription,
+    ttl: Option<TtlDescription>,
+) -> Result<TableDescription, AwsError> {
+    let name = table
+        .table_name
+        .ok_or_else(|| malformed("DescribeTable returned no table name".to_string()))?;
+
+    let types = table
+        .attribute_definitions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|def| {
+            Ok((
+                def.attribute_name,
+                scalar_to_type_code(&def.attribute_type)?,
+            ))
+        })
+        .collect::<Result<HashMap<String, TypeCode>, AwsError>>()?;
+
+    let (pk, sk) = resolve_key_schema(
+        table.key_schema.unwrap_or_default(),
+        &types,
+        "table key schema",
+    )?;
+
+    let gsis = table
+        .global_secondary_indexes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|gsi| resolve_index(gsi.index_name, gsi.key_schema, &types, "GSI"))
+        .collect::<Result<Vec<_>, AwsError>>()?;
+
+    let lsis = table
+        .local_secondary_indexes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|lsi| resolve_index(lsi.index_name, lsi.key_schema, &types, "LSI"))
+        .collect::<Result<Vec<_>, AwsError>>()?;
+
+    let on_demand = matches!(
+        table.billing_mode_summary.and_then(|b| b.billing_mode),
+        Some(BillingMode::PayPerRequest)
+    );
+    let provisioned_rcu = if on_demand {
+        None
+    } else {
+        table
+            .provisioned_throughput
+            .and_then(|p| p.read_capacity_units)
+            .filter(|&rcu| rcu > 0)
+            .map(|rcu| rcu as u64)
+    };
+
+    Ok(TableDescription {
+        name,
+        key_schema: TableKeySchema { pk, sk },
+        gsis,
+        lsis,
+        ttl,
+        provisioned_rcu,
+        item_count: table.item_count.unwrap_or(0).max(0) as u64,
+    })
+}
+
+fn resolve_index(
+    index_name: Option<String>,
+    key_schema: Option<Vec<SdkKeySchemaElement>>,
+    types: &HashMap<String, TypeCode>,
+    kind: &str,
+) -> Result<IndexSchema, AwsError> {
+    let name = index_name.ok_or_else(|| malformed(format!("{kind} has no name")))?;
+    let (pk, sk) = resolve_key_schema(
+        key_schema.unwrap_or_default(),
+        types,
+        &format!("{kind} `{name}`"),
+    )?;
+    Ok(IndexSchema { name, pk, sk })
+}
+
+fn resolve_key_schema(
+    key_schema: Vec<SdkKeySchemaElement>,
+    types: &HashMap<String, TypeCode>,
+    context: &str,
+) -> Result<(KeySchemaElement, Option<KeySchemaElement>), AwsError> {
+    let mut pk = None;
+    let mut sk = None;
+    for element in key_schema {
+        let name = element.attribute_name;
+        let type_code = *types.get(&name).ok_or_else(|| {
+            malformed(format!(
+                "{context}: key attribute `{name}` missing from attribute definitions"
+            ))
+        })?;
+        let resolved = KeySchemaElement { name, type_code };
+        match element.key_type {
+            KeyType::Hash => pk = Some(resolved),
+            KeyType::Range => sk = Some(resolved),
+            other => {
+                return Err(malformed(format!(
+                    "{context}: unexpected key type `{other:?}`"
+                )));
+            }
+        }
+    }
+
+    let pk = pk.ok_or_else(|| malformed(format!("{context}: no partition key")))?;
+    Ok((pk, sk))
+}
+
+fn scalar_to_type_code(attribute_type: &ScalarAttributeType) -> Result<TypeCode, AwsError> {
+    match attribute_type {
+        ScalarAttributeType::S => Ok(TypeCode::S),
+        ScalarAttributeType::N => Ok(TypeCode::N),
+        ScalarAttributeType::B => Ok(TypeCode::B),
+        other => Err(malformed(format!(
+            "unsupported key attribute type `{other:?}`"
+        ))),
+    }
+}
+
+fn malformed(message: String) -> AwsError {
+    AwsError {
+        code: "MalformedDescribeTable".to_string(),
+        message,
+        kind: AwsErrorKind::Other,
     }
 }
 
@@ -504,9 +678,120 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, GlobalSecondaryIndexDescription, KeySchemaElement as SdkKse,
+        LocalSecondaryIndexDescription, ProvisionedThroughputDescription,
+    };
+    use aws_sdk_dynamodb::types::{
+        BillingMode as SdkBillingMode, BillingModeSummary, KeyType as SdkKeyType,
+        ScalarAttributeType as SdkScalar, TableDescription as SdkTable,
+    };
+
     use super::mock::MockDynamoClient;
     use super::*;
     use crate::domain::{AttributeValue, TypeCode};
+
+    fn attr(name: &str, ty: SdkScalar) -> AttributeDefinition {
+        AttributeDefinition::builder()
+            .attribute_name(name)
+            .attribute_type(ty)
+            .build()
+            .unwrap()
+    }
+
+    fn key(name: &str, key_type: SdkKeyType) -> SdkKse {
+        SdkKse::builder()
+            .attribute_name(name)
+            .key_type(key_type)
+            .build()
+            .unwrap()
+    }
+
+    fn provisioned_table() -> SdkTable {
+        SdkTable::builder()
+            .table_name("users")
+            .item_count(1000)
+            .set_attribute_definitions(Some(vec![
+                attr("id", SdkScalar::S),
+                attr("createdAt", SdkScalar::N),
+                attr("email", SdkScalar::S),
+            ]))
+            .key_schema(key("id", SdkKeyType::Hash))
+            .global_secondary_indexes(
+                GlobalSecondaryIndexDescription::builder()
+                    .index_name("email-index")
+                    .key_schema(key("email", SdkKeyType::Hash))
+                    .key_schema(key("createdAt", SdkKeyType::Range))
+                    .build(),
+            )
+            .local_secondary_indexes(
+                LocalSecondaryIndexDescription::builder()
+                    .index_name("createdAt-lsi")
+                    .key_schema(key("id", SdkKeyType::Hash))
+                    .key_schema(key("createdAt", SdkKeyType::Range))
+                    .build(),
+            )
+            .provisioned_throughput(
+                ProvisionedThroughputDescription::builder()
+                    .read_capacity_units(120)
+                    .write_capacity_units(10)
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn maps_provisioned_table_schema_with_index_types() {
+        let ttl = Some(TtlDescription {
+            attribute: "expiresAt".to_string(),
+            enabled: true,
+        });
+        let mapped = map_table_description(provisioned_table(), ttl.clone()).unwrap();
+
+        assert_eq!(mapped.name, "users");
+        assert_eq!(mapped.item_count, 1000);
+        assert_eq!(mapped.provisioned_rcu, Some(120));
+        assert_eq!(mapped.ttl, ttl);
+
+        assert_eq!(mapped.key_schema.pk.type_code, TypeCode::S);
+        assert!(mapped.key_schema.sk.is_none());
+
+        let gsi = &mapped.gsis[0];
+        assert_eq!(gsi.name, "email-index");
+        assert_eq!(gsi.pk.type_code, TypeCode::S);
+        assert_eq!(gsi.sk.as_ref().unwrap().type_code, TypeCode::N);
+
+        let lsi = &mapped.lsis[0];
+        assert_eq!(lsi.name, "createdAt-lsi");
+        assert_eq!(lsi.sk.as_ref().unwrap().name, "createdAt");
+    }
+
+    #[test]
+    fn on_demand_table_has_no_provisioned_rcu() {
+        let table = SdkTable::builder()
+            .table_name("events")
+            .set_attribute_definitions(Some(vec![attr("id", SdkScalar::S)]))
+            .key_schema(key("id", SdkKeyType::Hash))
+            .billing_mode_summary(
+                BillingModeSummary::builder()
+                    .billing_mode(SdkBillingMode::PayPerRequest)
+                    .build(),
+            )
+            .build();
+        let mapped = map_table_description(table, None).unwrap();
+        assert_eq!(mapped.provisioned_rcu, None);
+    }
+
+    #[test]
+    fn key_attribute_without_type_definition_is_malformed() {
+        let table = SdkTable::builder()
+            .table_name("broken")
+            .key_schema(key("id", SdkKeyType::Hash))
+            .build();
+        let err = map_table_description(table, None).unwrap_err();
+        assert_eq!(err.kind, AwsErrorKind::Other);
+        assert_eq!(err.code, "MalformedDescribeTable");
+    }
 
     fn page(rcu: f64, next: Option<&str>) -> ScanResponse {
         ScanResponse {
