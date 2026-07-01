@@ -228,6 +228,27 @@ fn key_size_bytes(value: &AttributeValue) -> Option<usize> {
     }
 }
 
+/// Check one item against one LSI rule (PRD §6.1.2).
+///
+/// Only a missing sort key is reported, and only when the rule opts in via
+/// `check_missing`. LSI partition keys equal the table's, and DynamoDB validates
+/// type and size at write time, so no other violations are possible.
+pub fn check_lsi(item: &Item, rule: &LsiRule) -> Vec<Violation> {
+    if rule.check_missing && !item.contains_key(&rule.sort_key.name) {
+        return vec![Violation {
+            target: Target::Lsi(rule.name.clone()),
+            category: ViolationCategory::MissingKey,
+            attribute: Some(rule.sort_key.name.clone()),
+            actual_value: None,
+            actual_type: None,
+            expected_type: Some(rule.sort_key.type_code),
+            size_bytes: None,
+        }];
+    }
+
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +419,51 @@ mod tests {
         let violations = check_gsi(&it, &rule);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].category, ViolationCategory::TypeMismatch);
+    }
+
+    fn lsi(check_missing: bool) -> LsiRule {
+        LsiRule {
+            name: "LSI1".to_string(),
+            sort_key: element("createdAt", TypeCode::N),
+            check_missing,
+        }
+    }
+
+    #[test]
+    fn lsi_missing_sort_key_reported_when_enabled() {
+        let rule = lsi(true);
+        let it = item(&[("pk", AttributeValue::S("u-1".to_string()))]);
+
+        let violations = check_lsi(&it, &rule);
+        assert_eq!(violations.len(), 1);
+        let v = &violations[0];
+        assert_eq!(v.target, Target::Lsi("LSI1".to_string()));
+        assert_eq!(v.category, ViolationCategory::MissingKey);
+        assert_eq!(v.attribute.as_deref(), Some("createdAt"));
+        assert_eq!(v.expected_type, Some(TypeCode::N));
+    }
+
+    #[test]
+    fn lsi_missing_sort_key_ignored_when_disabled() {
+        let rule = lsi(false);
+        let it = item(&[("pk", AttributeValue::S("u-1".to_string()))]);
+        assert!(check_lsi(&it, &rule).is_empty());
+    }
+
+    #[test]
+    fn lsi_present_sort_key_yields_no_violation() {
+        let rule = lsi(true);
+        let it = item(&[
+            ("pk", AttributeValue::S("u-1".to_string())),
+            ("createdAt", AttributeValue::N("123".to_string())),
+        ]);
+        assert!(check_lsi(&it, &rule).is_empty());
+    }
+
+    #[test]
+    fn lsi_ignores_sort_key_type_and_size() {
+        let rule = lsi(true);
+        let it = item(&[("createdAt", AttributeValue::S("a".repeat(5000)))]);
+        assert!(check_lsi(&it, &rule).is_empty());
     }
 }
