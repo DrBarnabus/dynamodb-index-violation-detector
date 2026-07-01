@@ -93,6 +93,29 @@ pub struct TtlRule {
     pub check_past_5_years: bool,
 }
 
+/// Check one item against every enabled rule in a single pass (PRD §8.1).
+///
+/// The item is read once and evaluated against every GSI, LSI and the TTL rule.
+/// `now_epoch_secs` is snapshotted once at scan start and threaded through to the
+/// TTL past-5-years check.
+pub fn check_item(item: &Item, rules: &RuleSet, now_epoch_secs: i64) -> Vec<Violation> {
+    let mut out = Vec::new();
+
+    for gsi in &rules.gsis {
+        out.extend(check_gsi(item, gsi));
+    }
+
+    for lsi in &rules.lsis {
+        out.extend(check_lsi(item, lsi));
+    }
+
+    if let Some(ttl) = &rules.ttl {
+        out.extend(check_ttl(item, ttl, now_epoch_secs));
+    }
+
+    out
+}
+
 /// Maximum byte size of a partition key value (DynamoDB index key limit).
 const PARTITION_KEY_MAX_BYTES: usize = 2048;
 /// Maximum byte size of a sort key value (DynamoDB index key limit).
@@ -682,5 +705,94 @@ mod tests {
         let mut rule = ttl_rule();
         rule.check_ms_magnitude = false;
         assert!(check_ttl(&ttl_num("1750000000000"), &rule, NOW).is_empty());
+    }
+
+    fn rule_set(gsis: Vec<GsiRule>, lsis: Vec<LsiRule>, ttl: Option<TtlRule>) -> RuleSet {
+        RuleSet {
+            table: "users".to_string(),
+            gsis,
+            lsis,
+            ttl,
+        }
+    }
+
+    #[test]
+    fn empty_rule_set_yields_no_violations() {
+        let rules = rule_set(vec![], vec![], None);
+        let it = item(&[("pk", AttributeValue::S("u-1".to_string()))]);
+        assert!(check_item(&it, &rules, NOW).is_empty());
+    }
+
+    #[test]
+    fn clean_item_against_dense_rules_is_empty() {
+        let rules = rule_set(
+            vec![gsi(
+                element("email", TypeCode::S),
+                Some(element("createdAt", TypeCode::N)),
+                true,
+            )],
+            vec![lsi(true)],
+            Some(ttl_rule()),
+        );
+        let it = item(&[
+            ("email", AttributeValue::S("a@b.c".to_string())),
+            ("createdAt", AttributeValue::N("1750000001".to_string())),
+            ("expiresAt", AttributeValue::N("1750000001".to_string())),
+        ]);
+        assert!(check_item(&it, &rules, NOW).is_empty());
+    }
+
+    #[test]
+    fn violations_aggregate_across_targets_in_order() {
+        let rules = rule_set(
+            vec![gsi(element("email", TypeCode::S), None, false)],
+            vec![lsi(true)],
+            Some(ttl_rule()),
+        );
+        let it = item(&[
+            ("email", AttributeValue::N("42".to_string())),
+            ("expiresAt", AttributeValue::N("-1".to_string())),
+        ]);
+
+        let violations = check_item(&it, &rules, NOW);
+        assert_eq!(violations.len(), 3);
+        assert_eq!(violations[0].target, Target::Gsi("GSI1".to_string()));
+        assert_eq!(violations[0].category, ViolationCategory::TypeMismatch);
+        assert_eq!(violations[1].target, Target::Lsi("LSI1".to_string()));
+        assert_eq!(violations[1].category, ViolationCategory::MissingKey);
+        assert_eq!(violations[2].target, Target::Ttl);
+        assert_eq!(violations[2].category, ViolationCategory::TtlMalformed);
+    }
+
+    #[test]
+    fn absent_ttl_rule_runs_no_ttl_checks() {
+        let rules = rule_set(vec![], vec![], None);
+        let it = item(&[("expiresAt", AttributeValue::S("oops".to_string()))]);
+        assert!(check_item(&it, &rules, NOW).is_empty());
+    }
+
+    #[test]
+    fn multiple_indexes_each_contribute() {
+        let gsi_a = GsiRule {
+            name: "byEmail".to_string(),
+            hypothetical: false,
+            pk: element("email", TypeCode::S),
+            sk: None,
+            check_missing: true,
+        };
+        let gsi_b = GsiRule {
+            name: "byPhone".to_string(),
+            hypothetical: true,
+            pk: element("phone", TypeCode::S),
+            sk: None,
+            check_missing: true,
+        };
+        let rules = rule_set(vec![gsi_a, gsi_b], vec![], None);
+        let it = item(&[("other", AttributeValue::S("x".to_string()))]);
+
+        let violations = check_item(&it, &rules, NOW);
+        assert_eq!(violations.len(), 2);
+        assert_eq!(violations[0].target, Target::Gsi("byEmail".to_string()));
+        assert_eq!(violations[1].target, Target::Gsi("byPhone".to_string()));
     }
 }
