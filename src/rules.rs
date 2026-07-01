@@ -249,6 +249,112 @@ pub fn check_lsi(item: &Item, rule: &LsiRule) -> Vec<Violation> {
     Vec::new()
 }
 
+/// Values above this magnitude are almost certainly milliseconds: in seconds
+/// this is roughly the year 5138, so any TTL beyond it is a `Date.now()` bug.
+const TTL_MS_MAGNITUDE_THRESHOLD: i64 = 100_000_000_000;
+/// A TTL more than this many seconds in the past is ignored by DynamoDB.
+const FIVE_YEARS_SECS: i64 = 5 * 365 * 24 * 60 * 60;
+
+/// The classification of a present, `N`-typed TTL value.
+enum TtlClass {
+    Ok,
+    Malformed,
+    MsMagnitude,
+    PastFiveYears,
+}
+
+/// Check one item against the TTL rule (PRD §6.1.3).
+///
+/// A present value is classified exactly once; the corresponding violation is
+/// reported only when its sub-toggle is enabled. `now_epoch_secs` anchors the
+/// past-5-years check, keeping the engine free of clock access.
+pub fn check_ttl(item: &Item, rule: &TtlRule, now_epoch_secs: i64) -> Vec<Violation> {
+    let Some(value) = item.get(&rule.attribute) else {
+        if rule.check_missing {
+            return vec![ttl_violation(
+                ViolationCategory::TtlMissing,
+                &rule.attribute,
+                None,
+                None,
+                None,
+            )];
+        }
+
+        return Vec::new();
+    };
+
+    let AttributeValue::N(raw) = value else {
+        if rule.check_wrong_type {
+            return vec![ttl_violation(
+                ViolationCategory::TtlWrongType,
+                &rule.attribute,
+                None,
+                Some(type_code_str(value).to_string()),
+                Some(TypeCode::N),
+            )];
+        }
+
+        return Vec::new();
+    };
+
+    let (category, enabled) = match classify_ttl(raw, now_epoch_secs) {
+        TtlClass::Ok => return Vec::new(),
+        TtlClass::Malformed => (ViolationCategory::TtlMalformed, rule.check_malformed),
+        TtlClass::MsMagnitude => (ViolationCategory::TtlMsMagnitude, rule.check_ms_magnitude),
+        TtlClass::PastFiveYears => (ViolationCategory::TtlPastFiveYears, rule.check_past_5_years),
+    };
+
+    if enabled {
+        return vec![ttl_violation(
+            category,
+            &rule.attribute,
+            Some(raw.clone()),
+            Some("N".to_string()),
+            None,
+        )];
+    }
+
+    Vec::new()
+}
+
+fn classify_ttl(raw: &str, now_epoch_secs: i64) -> TtlClass {
+    let Ok(value) = raw.parse::<i64>() else {
+        return TtlClass::Malformed;
+    };
+
+    if value <= 0 {
+        return TtlClass::Malformed;
+    }
+
+    if value > TTL_MS_MAGNITUDE_THRESHOLD {
+        return TtlClass::MsMagnitude;
+    }
+
+    if value <= now_epoch_secs - FIVE_YEARS_SECS {
+        return TtlClass::PastFiveYears;
+    }
+
+    TtlClass::Ok
+}
+
+fn ttl_violation(
+    category: ViolationCategory,
+    attribute: &str,
+    actual_value: Option<String>,
+    actual_type: Option<String>,
+    expected_type: Option<TypeCode>,
+) -> Violation {
+    Violation {
+        target: Target::Ttl,
+        category,
+        attribute: Some(attribute.to_string()),
+        actual_value,
+        actual_type,
+        expected_type,
+        size_bytes: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +571,116 @@ mod tests {
         let rule = lsi(true);
         let it = item(&[("createdAt", AttributeValue::S("a".repeat(5000)))]);
         assert!(check_lsi(&it, &rule).is_empty());
+    }
+
+    const NOW: i64 = 1_750_000_000;
+    const FIVE_YEARS_AGO: i64 = NOW - FIVE_YEARS_SECS;
+
+    fn ttl_rule() -> TtlRule {
+        TtlRule {
+            attribute: "expiresAt".to_string(),
+            check_missing: true,
+            check_wrong_type: true,
+            check_ms_magnitude: true,
+            check_malformed: true,
+            check_past_5_years: true,
+        }
+    }
+
+    fn ttl_num(value: &str) -> Item {
+        item(&[("expiresAt", AttributeValue::N(value.to_string()))])
+    }
+
+    #[test]
+    fn ttl_missing_respects_toggle() {
+        let mut rule = ttl_rule();
+        let it = item(&[("other", AttributeValue::S("x".to_string()))]);
+
+        let violations = check_ttl(&it, &rule, NOW);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, ViolationCategory::TtlMissing);
+        assert_eq!(violations[0].target, Target::Ttl);
+
+        rule.check_missing = false;
+        assert!(check_ttl(&it, &rule, NOW).is_empty());
+    }
+
+    #[test]
+    fn ttl_wrong_type_reported() {
+        let mut rule = ttl_rule();
+        let it = item(&[("expiresAt", AttributeValue::S("1750000000".to_string()))]);
+
+        let violations = check_ttl(&it, &rule, NOW);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, ViolationCategory::TtlWrongType);
+        assert_eq!(violations[0].actual_type.as_deref(), Some("S"));
+        assert_eq!(violations[0].expected_type, Some(TypeCode::N));
+
+        rule.check_wrong_type = false;
+        assert!(check_ttl(&it, &rule, NOW).is_empty());
+    }
+
+    #[test]
+    fn ttl_valid_recent_value_is_ok() {
+        let rule = ttl_rule();
+        assert!(check_ttl(&ttl_num("1750000000"), &rule, NOW).is_empty());
+    }
+
+    #[test]
+    fn ttl_malformed_values() {
+        let rule = ttl_rule();
+        for raw in ["0", "-1", "1.5", "abc", "99999999999999999999999"] {
+            let violations = check_ttl(&ttl_num(raw), &rule, NOW);
+            assert_eq!(violations.len(), 1, "raw={raw}");
+            assert_eq!(
+                violations[0].category,
+                ViolationCategory::TtlMalformed,
+                "raw={raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn ttl_ms_magnitude_boundary() {
+        let rule = ttl_rule();
+
+        assert!(
+            check_ttl(&ttl_num("100000000000"), &rule, NOW).is_empty(),
+            "10^11 is not yet millisecond magnitude"
+        );
+
+        let violations = check_ttl(&ttl_num("100000000001"), &rule, NOW);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, ViolationCategory::TtlMsMagnitude);
+
+        let ms = check_ttl(&ttl_num("1750000000000"), &rule, NOW);
+        assert_eq!(ms[0].category, ViolationCategory::TtlMsMagnitude);
+    }
+
+    #[test]
+    fn ttl_past_five_years_boundary() {
+        let rule = ttl_rule();
+
+        let at_boundary = FIVE_YEARS_AGO.to_string();
+        let violations = check_ttl(&ttl_num(&at_boundary), &rule, NOW);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, ViolationCategory::TtlPastFiveYears);
+
+        let just_after = (FIVE_YEARS_AGO + 1).to_string();
+        assert!(check_ttl(&ttl_num(&just_after), &rule, NOW).is_empty());
+    }
+
+    #[test]
+    fn ttl_toggle_off_does_not_reclassify() {
+        let mut rule = ttl_rule();
+        rule.check_malformed = false;
+        assert!(
+            check_ttl(&ttl_num("-1"), &rule, NOW).is_empty(),
+            "a negative value classifies as malformed, not past-5-years"
+        );
+
+        let mut rule = ttl_rule();
+        rule.check_ms_magnitude = false;
+        assert!(check_ttl(&ttl_num("1750000000000"), &rule, NOW).is_empty());
     }
 }
