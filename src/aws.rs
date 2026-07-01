@@ -355,3 +355,312 @@ fn classify_code(code: &str) -> AwsErrorKind {
         _ => AwsErrorKind::Other,
     }
 }
+
+#[cfg(test)]
+pub mod mock {
+    //! A scriptable [`DynamoClient`] for unit tests (PRD §8.2/§8.3).
+    //!
+    //! Scan responses are queued per segment and popped in call order, so tests
+    //! drive pagination, throttling and partial failures by scripting the queue.
+    //! Every call is recorded for assertions on segment fan-out, cursor threading
+    //! and consumed-capacity requests.
+
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::{
+        AwsError, AwsErrorKind, DynamoClient, GetItemRequest, ScanRequest, ScanResponse,
+        TableDescription,
+    };
+    use crate::domain::Item;
+
+    #[derive(Default)]
+    pub struct MockDynamoClient {
+        tables: Vec<String>,
+        describe: HashMap<String, Result<TableDescription, AwsError>>,
+        scan_pages: Mutex<HashMap<u32, VecDeque<Result<ScanResponse, AwsError>>>>,
+        get_item_responses: Mutex<VecDeque<Result<Option<Item>, AwsError>>>,
+        scan_calls: Mutex<Vec<ScanRequest>>,
+        describe_calls: Mutex<Vec<String>>,
+        list_calls: Mutex<u32>,
+        get_item_calls: Mutex<Vec<GetItemRequest>>,
+    }
+
+    impl MockDynamoClient {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn with_tables<I, S>(mut self, tables: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            self.tables = tables.into_iter().map(Into::into).collect();
+            self
+        }
+
+        pub fn with_describe(mut self, name: &str, desc: TableDescription) -> Self {
+            self.describe.insert(name.to_string(), Ok(desc));
+            self
+        }
+
+        pub fn with_describe_err(mut self, name: &str, err: AwsError) -> Self {
+            self.describe.insert(name.to_string(), Err(err));
+            self
+        }
+
+        /// Queues the pages returned for `segment`, in call order. The final page
+        /// must carry `last_evaluated_key: None` to terminate the segment.
+        pub fn with_scan_pages<I>(mut self, segment: u32, pages: I) -> Self
+        where
+            I: IntoIterator<Item = Result<ScanResponse, AwsError>>,
+        {
+            self.scan_pages
+                .get_mut()
+                .expect("mutex not poisoned before build")
+                .insert(segment, pages.into_iter().collect());
+            self
+        }
+
+        /// Queues one `get_item` response, returned in call order.
+        pub fn with_get_item(mut self, response: Result<Option<Item>, AwsError>) -> Self {
+            self.get_item_responses
+                .get_mut()
+                .expect("mutex not poisoned before build")
+                .push_back(response);
+            self
+        }
+
+        pub fn recorded_scans(&self) -> Vec<ScanRequest> {
+            self.scan_calls.lock().unwrap().clone()
+        }
+
+        pub fn recorded_describes(&self) -> Vec<String> {
+            self.describe_calls.lock().unwrap().clone()
+        }
+
+        pub fn recorded_get_items(&self) -> Vec<GetItemRequest> {
+            self.get_item_calls.lock().unwrap().clone()
+        }
+
+        pub fn list_tables_call_count(&self) -> u32 {
+            *self.list_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl DynamoClient for MockDynamoClient {
+        async fn list_tables(&self) -> Result<Vec<String>, AwsError> {
+            *self.list_calls.lock().unwrap() += 1;
+            Ok(self.tables.clone())
+        }
+
+        async fn describe_table(&self, name: &str) -> Result<TableDescription, AwsError> {
+            self.describe_calls.lock().unwrap().push(name.to_string());
+            match self.describe.get(name) {
+                Some(Ok(desc)) => Ok(desc.clone()),
+                Some(Err(err)) => Err(err.clone()),
+                None => Err(AwsError {
+                    code: "ResourceNotFoundException".to_string(),
+                    message: format!("no describe fixture for table `{name}`"),
+                    kind: AwsErrorKind::NotFound,
+                }),
+            }
+        }
+
+        async fn scan_segment(&self, req: ScanRequest) -> Result<ScanResponse, AwsError> {
+            let segment = req.segment;
+            self.scan_calls.lock().unwrap().push(req);
+            let mut pages = self.scan_pages.lock().unwrap();
+            match pages.get_mut(&segment) {
+                Some(queue) => queue.pop_front().unwrap_or_else(|| {
+                    Err(AwsError {
+                        code: "MockExhausted".to_string(),
+                        message: format!("segment {segment} scanned past its scripted pages"),
+                        kind: AwsErrorKind::Other,
+                    })
+                }),
+                None => Ok(ScanResponse {
+                    items: Vec::new(),
+                    last_evaluated_key: None,
+                    consumed_rcu: None,
+                }),
+            }
+        }
+
+        async fn get_item(&self, req: GetItemRequest) -> Result<Option<Item>, AwsError> {
+            self.get_item_calls.lock().unwrap().push(req);
+            self.get_item_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(None))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mock::MockDynamoClient;
+    use super::*;
+    use crate::domain::{AttributeValue, TypeCode};
+
+    fn page(rcu: f64, next: Option<&str>) -> ScanResponse {
+        ScanResponse {
+            items: vec![
+                [("pk".to_string(), AttributeValue::S("a".to_string()))]
+                    .into_iter()
+                    .collect(),
+            ],
+            last_evaluated_key: next.map(|k| {
+                [("pk".to_string(), AttributeValue::S(k.to_string()))]
+                    .into_iter()
+                    .collect()
+            }),
+            consumed_rcu: Some(rcu),
+        }
+    }
+
+    fn sample_table() -> TableDescription {
+        TableDescription {
+            name: "users".to_string(),
+            key_schema: TableKeySchema {
+                pk: KeySchemaElement {
+                    name: "id".to_string(),
+                    type_code: TypeCode::S,
+                },
+                sk: None,
+            },
+            gsis: Vec::new(),
+            lsis: Vec::new(),
+            ttl: None,
+            provisioned_rcu: Some(100),
+            item_count: 42,
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_pages_pop_in_order_and_record_calls() {
+        let client = MockDynamoClient::new()
+            .with_scan_pages(0, [Ok(page(2.0, Some("cursor"))), Ok(page(1.0, None))]);
+
+        let first = client
+            .scan_segment(ScanRequest {
+                table: "t".to_string(),
+                total_segments: 1,
+                segment: 0,
+                exclusive_start_key: None,
+                return_consumed_capacity: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.consumed_rcu, Some(2.0));
+        assert!(first.last_evaluated_key.is_some());
+
+        let second = client
+            .scan_segment(ScanRequest {
+                table: "t".to_string(),
+                total_segments: 1,
+                segment: 0,
+                exclusive_start_key: first.last_evaluated_key.clone(),
+                return_consumed_capacity: true,
+            })
+            .await
+            .unwrap();
+        assert!(second.last_evaluated_key.is_none());
+
+        let recorded = client.recorded_scans();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].exclusive_start_key, first.last_evaluated_key);
+    }
+
+    #[tokio::test]
+    async fn exhausting_a_scripted_segment_errors_loudly() {
+        let client = MockDynamoClient::new().with_scan_pages(0, [Ok(page(1.0, None))]);
+        let req = || ScanRequest {
+            table: "t".to_string(),
+            total_segments: 1,
+            segment: 0,
+            exclusive_start_key: None,
+            return_consumed_capacity: false,
+        };
+        client.scan_segment(req()).await.unwrap();
+
+        let err = client.scan_segment(req()).await.unwrap_err();
+        assert_eq!(err.kind, AwsErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn unscripted_segment_returns_empty_terminal_page() {
+        let client = MockDynamoClient::new();
+        let resp = client
+            .scan_segment(ScanRequest {
+                table: "t".to_string(),
+                total_segments: 4,
+                segment: 3,
+                exclusive_start_key: None,
+                return_consumed_capacity: false,
+            })
+            .await
+            .unwrap();
+        assert!(resp.items.is_empty());
+        assert!(resp.last_evaluated_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn injected_throttle_surfaces_as_error() {
+        let throttle = AwsError {
+            code: "ProvisionedThroughputExceededException".to_string(),
+            message: "slow down".to_string(),
+            kind: AwsErrorKind::Throttling,
+        };
+        let client = MockDynamoClient::new().with_scan_pages(0, [Err(throttle)]);
+        let err = client
+            .scan_segment(ScanRequest {
+                table: "t".to_string(),
+                total_segments: 1,
+                segment: 0,
+                exclusive_start_key: None,
+                return_consumed_capacity: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, AwsErrorKind::Throttling);
+    }
+
+    #[tokio::test]
+    async fn describe_returns_fixture_or_not_found() {
+        let client = MockDynamoClient::new().with_describe("users", sample_table());
+        assert_eq!(client.describe_table("users").await.unwrap().item_count, 42);
+
+        let err = client.describe_table("missing").await.unwrap_err();
+        assert_eq!(err.kind, AwsErrorKind::NotFound);
+        assert_eq!(client.recorded_describes(), vec!["users", "missing"]);
+    }
+
+    #[tokio::test]
+    async fn list_tables_returns_fixture_and_counts_calls() {
+        let client = MockDynamoClient::new().with_tables(["a", "b"]);
+        assert_eq!(client.list_tables().await.unwrap(), vec!["a", "b"]);
+        client.list_tables().await.unwrap();
+        assert_eq!(client.list_tables_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_item_pops_queue_then_defaults_to_none() {
+        let item: Item = [("pk".to_string(), AttributeValue::S("x".to_string()))]
+            .into_iter()
+            .collect();
+        let client = MockDynamoClient::new().with_get_item(Ok(Some(item.clone())));
+        let req = || GetItemRequest {
+            table: "t".to_string(),
+            key: item.clone(),
+        };
+        assert_eq!(client.get_item(req()).await.unwrap(), Some(item.clone()));
+        assert_eq!(client.get_item(req()).await.unwrap(), None);
+        assert_eq!(client.recorded_get_items().len(), 2);
+    }
+}
