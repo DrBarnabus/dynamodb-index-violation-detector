@@ -1,0 +1,5 @@
+{
+  "env": {
+    "CLAUDE_ALLOW_MAIN_COMMIT": "1"
+  }
+}
