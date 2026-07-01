@@ -5,12 +5,16 @@
 //! driver and TUI drive it with. Downstream code holds `Arc<dyn DynamoClient>`
 //! and never depends on the SDK types directly.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use async_trait::async_trait;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::primitives::Blob;
+use aws_sdk_dynamodb::types::{AttributeValue as SdkAttributeValue, ReturnConsumedCapacity};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Item, KeySchemaElement};
+use crate::domain::{AttributeValue, Item, KeySchemaElement};
 
 /// A table's schema as discovered via `DescribeTable` (PRD §8.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +127,30 @@ pub enum AwsErrorKind {
     Other,
 }
 
+impl AwsError {
+    /// A one-line remediation hint for the terminal error modal (PRD §6.3.7).
+    /// `None` for [`AwsErrorKind::Other`], which has no generic fix.
+    pub fn remediation(&self) -> Option<&'static str> {
+        match self.kind {
+            AwsErrorKind::Auth => Some(
+                "Credentials are missing or expired. Run `aws sso login --profile <name>` \
+                 (or refresh your credentials) and retry.",
+            ),
+            AwsErrorKind::NotFound => Some(
+                "Check the table name and that you are targeting the right account and region.",
+            ),
+            AwsErrorKind::AccessDenied => Some(
+                "Credentials lack the required IAM permission. Grant dynamodb:Scan, \
+                 DescribeTable, GetItem and ListTables.",
+            ),
+            AwsErrorKind::Throttling => Some(
+                "The table is throttling. Lower the rate-limit percentage or segment count and retry.",
+            ),
+            AwsErrorKind::Other => None,
+        }
+    }
+}
+
 impl fmt::Display for AwsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.code, self.message)
@@ -130,3 +158,200 @@ impl fmt::Display for AwsError {
 }
 
 impl std::error::Error for AwsError {}
+
+/// The production [`DynamoClient`] backed by `aws-sdk-dynamodb`.
+pub struct RealDynamoClient {
+    client: aws_sdk_dynamodb::Client,
+}
+
+impl RealDynamoClient {
+    /// Builds a client from the default credential provider chain (env, shared
+    /// config, SSO, IMDS, container), honouring an optional profile and region
+    /// override (PRD §6.4). Region falls back to the profile/environment when
+    /// `None`.
+    pub async fn new(profile: Option<&str>, region: Option<&str>) -> Self {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(profile) = profile {
+            loader = loader.profile_name(profile);
+        }
+
+        if let Some(region) = region {
+            loader = loader.region(aws_sdk_dynamodb::config::Region::new(region.to_string()));
+        }
+
+        let sdk_config = loader.load().await;
+        Self {
+            client: aws_sdk_dynamodb::Client::new(&sdk_config),
+        }
+    }
+
+    /// Wraps an already-constructed SDK client (used when the caller owns
+    /// `SdkConfig`, e.g. to share it across services).
+    pub fn from_client(client: aws_sdk_dynamodb::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl DynamoClient for RealDynamoClient {
+    async fn list_tables(&self) -> Result<Vec<String>, AwsError> {
+        let mut names = Vec::new();
+        let mut start = None;
+        loop {
+            let out = self
+                .client
+                .list_tables()
+                .set_exclusive_start_table_name(start)
+                .send()
+                .await
+                .map_err(map_sdk_error)?;
+            names.extend(out.table_names.unwrap_or_default());
+            match out.last_evaluated_table_name {
+                Some(next) => start = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(names)
+    }
+
+    async fn describe_table(&self, _name: &str) -> Result<TableDescription, AwsError> {
+        Err(AwsError {
+            code: "NotImplemented".to_string(),
+            message: "DescribeTable schema discovery is delivered by task #13".to_string(),
+            kind: AwsErrorKind::Other,
+        })
+    }
+
+    async fn scan_segment(&self, req: ScanRequest) -> Result<ScanResponse, AwsError> {
+        let mut builder = self
+            .client
+            .scan()
+            .table_name(req.table)
+            .total_segments(req.total_segments as i32)
+            .segment(req.segment as i32)
+            .set_exclusive_start_key(req.exclusive_start_key.map(to_sdk_map));
+        if req.return_consumed_capacity {
+            builder = builder.return_consumed_capacity(ReturnConsumedCapacity::Total);
+        }
+
+        let out = builder.send().await.map_err(map_sdk_error)?;
+        Ok(ScanResponse {
+            items: out
+                .items
+                .unwrap_or_default()
+                .into_iter()
+                .map(from_sdk_map)
+                .collect(),
+            last_evaluated_key: out.last_evaluated_key.map(from_sdk_map),
+            consumed_rcu: out.consumed_capacity.and_then(|c| c.capacity_units()),
+        })
+    }
+
+    async fn get_item(&self, req: GetItemRequest) -> Result<Option<Item>, AwsError> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(req.table)
+            .set_key(Some(to_sdk_map(req.key)))
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(out.item.map(from_sdk_map))
+    }
+}
+
+fn to_sdk_map(item: Item) -> HashMap<String, SdkAttributeValue> {
+    item.into_iter()
+        .map(|(k, v)| (k, to_sdk_value(v)))
+        .collect()
+}
+
+fn from_sdk_map(item: HashMap<String, SdkAttributeValue>) -> Item {
+    item.into_iter()
+        .map(|(k, v)| (k, from_sdk_value(v)))
+        .collect()
+}
+
+fn to_sdk_value(value: AttributeValue) -> SdkAttributeValue {
+    match value {
+        AttributeValue::S(s) => SdkAttributeValue::S(s),
+        AttributeValue::N(n) => SdkAttributeValue::N(n),
+        AttributeValue::B(b) => SdkAttributeValue::B(Blob::new(b)),
+        AttributeValue::Bool(b) => SdkAttributeValue::Bool(b),
+        AttributeValue::Null(n) => SdkAttributeValue::Null(n),
+        AttributeValue::M(m) => {
+            SdkAttributeValue::M(m.into_iter().map(|(k, v)| (k, to_sdk_value(v))).collect())
+        }
+        AttributeValue::L(l) => SdkAttributeValue::L(l.into_iter().map(to_sdk_value).collect()),
+        AttributeValue::Ss(s) => SdkAttributeValue::Ss(s),
+        AttributeValue::Ns(n) => SdkAttributeValue::Ns(n),
+        AttributeValue::Bs(b) => SdkAttributeValue::Bs(b.into_iter().map(Blob::new).collect()),
+    }
+}
+
+fn from_sdk_value(value: SdkAttributeValue) -> AttributeValue {
+    match value {
+        SdkAttributeValue::S(s) => AttributeValue::S(s),
+        SdkAttributeValue::N(n) => AttributeValue::N(n),
+        SdkAttributeValue::B(b) => AttributeValue::B(b.into_inner()),
+        SdkAttributeValue::Bool(b) => AttributeValue::Bool(b),
+        SdkAttributeValue::Null(n) => AttributeValue::Null(n),
+        SdkAttributeValue::M(m) => {
+            AttributeValue::M(m.into_iter().map(|(k, v)| (k, from_sdk_value(v))).collect())
+        }
+        SdkAttributeValue::L(l) => AttributeValue::L(l.into_iter().map(from_sdk_value).collect()),
+        SdkAttributeValue::Ss(s) => AttributeValue::Ss(s),
+        SdkAttributeValue::Ns(n) => AttributeValue::Ns(n),
+        SdkAttributeValue::Bs(b) => {
+            AttributeValue::Bs(b.into_iter().map(Blob::into_inner).collect())
+        }
+        other => unreachable!("unexpected DynamoDB attribute value: {other:?}"),
+    }
+}
+
+fn map_sdk_error<E, R>(err: SdkError<E, R>) -> AwsError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    R: std::fmt::Debug,
+{
+    match &err {
+        SdkError::ConstructionFailure(_) | SdkError::DispatchFailure(_) => AwsError {
+            code: "CredentialsError".to_string(),
+            message: format!("could not sign or dispatch the request: {err}"),
+            kind: AwsErrorKind::Auth,
+        },
+        SdkError::TimeoutError(_) => AwsError {
+            code: "TimeoutError".to_string(),
+            message: "the request timed out after the SDK retry budget was exhausted".to_string(),
+            kind: AwsErrorKind::Throttling,
+        },
+        _ => {
+            let code = err.code().unwrap_or("UnknownError").to_string();
+            let message = err
+                .message()
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string());
+            let kind = classify_code(&code);
+            AwsError {
+                code,
+                message,
+                kind,
+            }
+        }
+    }
+}
+
+fn classify_code(code: &str) -> AwsErrorKind {
+    match code {
+        "ResourceNotFoundException" => AwsErrorKind::NotFound,
+        "AccessDeniedException" | "UnrecognizedClientException" => AwsErrorKind::AccessDenied,
+        "ExpiredTokenException" | "ExpiredToken" | "InvalidSignatureException" => {
+            AwsErrorKind::Auth
+        }
+        "ProvisionedThroughputExceededException"
+        | "ThrottlingException"
+        | "RequestLimitExceeded" => AwsErrorKind::Throttling,
+        _ => AwsErrorKind::Other,
+    }
+}
