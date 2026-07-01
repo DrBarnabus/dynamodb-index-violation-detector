@@ -84,16 +84,19 @@ pub struct ExportConfig {
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub table: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default)]
     pub scan: ScanSettings,
     #[serde(default)]
     pub export: ExportSettings,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<TtlSettings>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gsi: Vec<GsiEntry>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lsi: Vec<LsiEntry>,
 }
 
@@ -101,7 +104,9 @@ pub struct ConfigFile {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub segments: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_percent: Option<u8>,
 }
 
@@ -109,9 +114,13 @@ pub struct ScanSettings {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub csv: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub csv_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ndjson: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ndjson_path: Option<PathBuf>,
 }
 
@@ -120,11 +129,17 @@ pub struct ExportSettings {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtlSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_missing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_wrong_type: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_ms_magnitude: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_malformed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_past_5_years: Option<bool>,
 }
 
@@ -137,7 +152,9 @@ pub struct GsiEntry {
     pub name: String,
     #[serde(default)]
     pub hypothetical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pk: Option<KeySchemaElement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sk: Option<KeySchemaElement>,
     #[serde(default)]
     pub check_missing: bool,
@@ -163,7 +180,12 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Parse(toml::de::Error),
+    Serialize(toml::ser::Error),
     MissingTable,
     EmptyTable,
     EmptyIndexName,
@@ -181,7 +203,11 @@ impl fmt::Display for ConfigError {
             ConfigError::Read { path, source } => {
                 write!(f, "cannot read config `{}`: {source}", path.display())
             }
+            ConfigError::Write { path, source } => {
+                write!(f, "cannot write config `{}`: {source}", path.display())
+            }
             ConfigError::Parse(e) => write!(f, "invalid TOML: {e}"),
+            ConfigError::Serialize(e) => write!(f, "cannot serialise config: {e}"),
             ConfigError::MissingTable => write!(
                 f,
                 "no table specified; set `table` in the config or pass --table"
@@ -229,8 +255,9 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ConfigError::Read { source, .. } => Some(source),
+            ConfigError::Read { source, .. } | ConfigError::Write { source, .. } => Some(source),
             ConfigError::Parse(e) => Some(e),
+            ConfigError::Serialize(e) => Some(e),
             _ => None,
         }
     }
@@ -414,6 +441,67 @@ fn default_segments() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Project a resolved [`ScanConfig`] back onto the on-disk schema.
+///
+/// The intents (`gsi`/`lsi`/`ttl`) are carried verbatim, so a saved config never
+/// leaks discovered schema: existing GSIs keep only their name and
+/// `check_missing`, matching how they were authored.
+impl From<&ScanConfig> for ConfigFile {
+    fn from(config: &ScanConfig) -> Self {
+        ConfigFile {
+            table: config.table.clone(),
+            region: config.region.clone(),
+            profile: config.profile.clone(),
+            scan: ScanSettings {
+                segments: Some(config.segments),
+                rate_limit_percent: config.rate_limit_percent,
+            },
+            export: ExportSettings {
+                csv: Some(config.export.csv),
+                csv_path: config.export.csv_path.clone(),
+                ndjson: Some(config.export.ndjson),
+                ndjson_path: config.export.ndjson_path.clone(),
+            },
+            ttl: config.ttl.clone(),
+            gsi: config.gsi.clone(),
+            lsi: config.lsi.clone(),
+        }
+    }
+}
+
+/// Serialise the current setup to a TOML config file (PRD §8.7, TUI Save config).
+///
+/// Round-trips with [`load`]: `load(save(cfg))` yields an equal [`ScanConfig`].
+pub fn save(config: &ScanConfig, path: &Path) -> Result<(), ConfigError> {
+    let file = ConfigFile::from(config);
+    let text = toml::to_string_pretty(&file).map_err(ConfigError::Serialize)?;
+    fs::write(path, text).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// The default export path for one format: `violations-{table}-{timestamp}.{ext}`
+/// in the current directory (PRD §6.6).
+///
+/// `timestamp` is supplied by the caller — a pure resolver has no clock — so the
+/// shell injects the real time and tests inject a fixed stamp.
+pub fn default_export_path(table: &str, timestamp: &str, ext: &str) -> PathBuf {
+    PathBuf::from(format!("violations-{table}-{timestamp}.{ext}"))
+}
+
+/// Fill any unset export path for an enabled format with the default template
+/// (PRD §6.6). Paths already set by the config or CLI are left untouched.
+pub fn resolve_export_paths(config: &mut ScanConfig, timestamp: &str) {
+    if config.export.csv && config.export.csv_path.is_none() {
+        config.export.csv_path = Some(default_export_path(&config.table, timestamp, "csv"));
+    }
+
+    if config.export.ndjson && config.export.ndjson_path.is_none() {
+        config.export.ndjson_path = Some(default_export_path(&config.table, timestamp, "ndjson"));
+    }
 }
 
 #[cfg(test)]
@@ -781,5 +869,87 @@ name = "dup"
         let path = std::env::temp_dir().join("ddb-violation-detector-does-not-exist.toml");
         let err = load(Some(&path), &cli()).unwrap_err();
         assert!(matches!(err, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn save_load_round_trips_the_full_config() {
+        let original = merge(Some(parse(FULL).unwrap()), &cli()).unwrap();
+
+        let path = std::env::temp_dir().join("ddb-violation-detector-roundtrip.toml");
+        save(&original, &path).unwrap();
+        let reloaded = load(Some(&path), &cli()).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(original, reloaded);
+    }
+
+    #[test]
+    fn saved_existing_gsi_has_no_key_schema() {
+        let config = merge(Some(parse(FULL).unwrap()), &cli()).unwrap();
+        let text = toml::to_string_pretty(&ConfigFile::from(&config)).unwrap();
+        let reparsed = parse(&text).unwrap();
+
+        let existing = &reparsed.gsi[0];
+        assert_eq!(existing.name, "GSI1");
+        assert!(!existing.hypothetical);
+        assert!(existing.pk.is_none(), "existing GSI must not carry a pk");
+        assert!(existing.sk.is_none(), "existing GSI must not carry an sk");
+
+        let hypothetical = &reparsed.gsi[1];
+        assert!(hypothetical.hypothetical);
+        assert!(hypothetical.pk.is_some(), "hypothetical GSI keeps its pk");
+    }
+
+    #[test]
+    fn saved_config_reparses() {
+        let config = merge(Some(parse(FULL).unwrap()), &cli()).unwrap();
+        let text = toml::to_string_pretty(&ConfigFile::from(&config)).unwrap();
+        parse(&text).unwrap_or_else(|e| panic!("saved config should reparse: {e}\n{text}"));
+    }
+
+    #[test]
+    fn default_export_path_uses_the_template() {
+        let path = default_export_path("users", "20260701-193900", "csv");
+        assert_eq!(
+            path,
+            std::path::Path::new("violations-users-20260701-193900.csv")
+        );
+    }
+
+    #[test]
+    fn resolve_export_paths_fills_only_unset_enabled_formats() {
+        let mut config = merge(None, &{
+            CliArgs {
+                table: Some("users".to_string()),
+                ..cli()
+            }
+        })
+        .unwrap();
+        config.export.csv_path = Some(PathBuf::from("./pinned.csv"));
+
+        resolve_export_paths(&mut config, "20260701-193900");
+
+        assert_eq!(config.export.csv_path, Some(PathBuf::from("./pinned.csv")));
+        assert_eq!(
+            config.export.ndjson_path,
+            Some(PathBuf::from("violations-users-20260701-193900.ndjson"))
+        );
+    }
+
+    #[test]
+    fn resolve_export_paths_skips_disabled_formats() {
+        let mut config = merge(None, &{
+            CliArgs {
+                table: Some("users".to_string()),
+                ..cli()
+            }
+        })
+        .unwrap();
+        config.export.csv = false;
+
+        resolve_export_paths(&mut config, "ts");
+
+        assert_eq!(config.export.csv_path, None);
+        assert!(config.export.ndjson_path.is_some());
     }
 }
