@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod assemble;
 mod aws;
 mod config;
 mod domain;
