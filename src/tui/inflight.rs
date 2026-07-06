@@ -14,21 +14,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::rules::ViolationCategory;
+use super::{ALL_CATEGORIES, category_label};
 use crate::state::StateSnapshot;
-
-/// Every violation category in a stable display order, so the counts panel and
-/// its snapshot tests are deterministic regardless of detection order.
-const ALL_CATEGORIES: [ViolationCategory; 8] = [
-    ViolationCategory::TypeMismatch,
-    ViolationCategory::SizeExceeded,
-    ViolationCategory::MissingKey,
-    ViolationCategory::TtlMissing,
-    ViolationCategory::TtlWrongType,
-    ViolationCategory::TtlMsMagnitude,
-    ViolationCategory::TtlMalformed,
-    ViolationCategory::TtlPastFiveYears,
-];
 
 /// Width of the inline per-segment progress bars, in cells.
 const BAR_WIDTH: usize = 24;
@@ -243,22 +230,10 @@ fn fmt_duration(duration: Duration) -> String {
     }
 }
 
-fn category_label(category: ViolationCategory) -> &'static str {
-    match category {
-        ViolationCategory::TypeMismatch => "Type mismatch",
-        ViolationCategory::SizeExceeded => "Size exceeded",
-        ViolationCategory::MissingKey => "Missing key",
-        ViolationCategory::TtlMissing => "TTL missing",
-        ViolationCategory::TtlWrongType => "TTL wrong type",
-        ViolationCategory::TtlMsMagnitude => "TTL ms magnitude",
-        ViolationCategory::TtlMalformed => "TTL malformed",
-        ViolationCategory::TtlPastFiveYears => "TTL >5y past",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::ViolationCategory;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
