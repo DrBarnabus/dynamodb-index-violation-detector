@@ -9,6 +9,7 @@ use std::io::{self, Write};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::Serialize;
 
 use crate::domain::{AttributeValue, KeyAttribute, TypeCode};
 use crate::rules::{ItemViolations, Target, Violation, ViolationCategory};
@@ -18,6 +19,7 @@ use crate::rules::{ItemViolations, Target, Violation, ViolationCategory};
 pub enum ExportError {
     Io(io::Error),
     Csv(csv::Error),
+    Json(serde_json::Error),
 }
 
 impl fmt::Display for ExportError {
@@ -25,6 +27,7 @@ impl fmt::Display for ExportError {
         match self {
             ExportError::Io(e) => write!(f, "export I/O failure: {e}"),
             ExportError::Csv(e) => write!(f, "CSV serialisation failure: {e}"),
+            ExportError::Json(e) => write!(f, "NDJSON serialisation failure: {e}"),
         }
     }
 }
@@ -34,6 +37,7 @@ impl std::error::Error for ExportError {
         match self {
             ExportError::Io(e) => Some(e),
             ExportError::Csv(e) => Some(e),
+            ExportError::Json(e) => Some(e),
         }
     }
 }
@@ -47,6 +51,12 @@ impl From<io::Error> for ExportError {
 impl From<csv::Error> for ExportError {
     fn from(e: csv::Error) -> Self {
         ExportError::Csv(e)
+    }
+}
+
+impl From<serde_json::Error> for ExportError {
+    fn from(e: serde_json::Error) -> Self {
+        ExportError::Json(e)
     }
 }
 
@@ -126,7 +136,7 @@ impl<W: Write> ExportWriter for CsvWriter<W> {
                 violation.attribute.as_deref().unwrap_or(""),
                 violation.actual_value.as_deref().unwrap_or(""),
                 violation.actual_type.as_deref().unwrap_or(""),
-                expected_type_label(violation),
+                expected_type_code(violation).unwrap_or(""),
                 size_bytes_label(violation).as_str(),
                 detected_at.as_str(),
             ])?;
@@ -139,6 +149,153 @@ impl<W: Write> ExportWriter for CsvWriter<W> {
     fn close(mut self: Box<Self>) -> Result<(), ExportError> {
         self.writer.flush()?;
         Ok(())
+    }
+}
+
+/// One JSON object per item, one per line (PRD §6.6). An item with multiple
+/// violations stays a single record carrying a `violations` array; table and
+/// timestamp are duplicated per record so each line is self-contained. PK/SK are
+/// emitted in native DynamoDB JSON shape, with binary base64-encoded.
+pub struct NdjsonWriter<W: Write> {
+    inner: W,
+}
+
+impl<W: Write> NdjsonWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner }
+    }
+
+    /// Reclaim the underlying writer for byte-exact assertions in tests.
+    pub fn into_inner(mut self) -> Result<W, ExportError> {
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> ExportWriter for NdjsonWriter<W> {
+    fn write(&mut self, group: &ItemViolations) -> Result<(), ExportError> {
+        let record = NdjsonRecord {
+            table: &group.table,
+            detected_at: group.detected_at,
+            pk: key_object(&group.pk),
+            sk: group.sk.as_ref().map(key_object),
+            violations: group.violations.iter().map(ndjson_violation).collect(),
+        };
+        serde_json::to_writer(&mut self.inner, &record)?;
+        self.inner.write_all(b"\n")?;
+        self.inner.flush()?;
+
+        Ok(())
+    }
+
+    fn close(mut self: Box<Self>) -> Result<(), ExportError> {
+        self.inner.flush()?;
+        Ok(())
+    }
+}
+
+/// Fans a single stream of groups out to several writers, so CSV and NDJSON are
+/// produced in one scan pass (PRD §6.6). Each wrapped format is toggled by
+/// simply omitting its writer from the set.
+pub struct FanOutWriter {
+    writers: Vec<Box<dyn ExportWriter>>,
+}
+
+impl FanOutWriter {
+    pub fn new(writers: Vec<Box<dyn ExportWriter>>) -> Self {
+        Self { writers }
+    }
+}
+
+impl ExportWriter for FanOutWriter {
+    fn write(&mut self, group: &ItemViolations) -> Result<(), ExportError> {
+        for writer in &mut self.writers {
+            writer.write(group)?;
+        }
+
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<(), ExportError> {
+        for writer in self.writers {
+            writer.close()?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct NdjsonRecord<'a> {
+    table: &'a str,
+    detected_at: i64,
+    pk: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sk: Option<serde_json::Value>,
+    violations: Vec<NdjsonViolation<'a>>,
+}
+
+#[derive(Serialize)]
+struct NdjsonViolation<'a> {
+    target: String,
+    category: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribute: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_value: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<usize>,
+}
+
+fn ndjson_violation(violation: &Violation) -> NdjsonViolation<'_> {
+    NdjsonViolation {
+        target: target_label(&violation.target),
+        category: category_label(violation.category),
+        attribute: violation.attribute.as_deref(),
+        actual_value: violation.actual_value.as_deref(),
+        actual_type: violation.actual_type.as_deref(),
+        expected_type: expected_type_code(violation),
+        size_bytes: violation.size_bytes,
+    }
+}
+
+/// A single-key object mapping the attribute name to its native-shape value.
+fn key_object(key: &KeyAttribute) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(key.name.clone(), native_value(&key.value));
+    serde_json::Value::Object(map)
+}
+
+/// Render an attribute value in native DynamoDB JSON shape, recursively, with
+/// binary encoded as base64 strings.
+fn native_value(value: &AttributeValue) -> serde_json::Value {
+    use serde_json::{Value, json};
+
+    match value {
+        AttributeValue::S(s) => json!({ "S": s }),
+        AttributeValue::N(n) => json!({ "N": n }),
+        AttributeValue::B(b) => json!({ "B": BASE64.encode(b) }),
+        AttributeValue::Bool(b) => json!({ "BOOL": b }),
+        AttributeValue::Null(_) => json!({ "NULL": true }),
+        AttributeValue::M(m) => {
+            let entries: serde_json::Map<String, Value> = m
+                .iter()
+                .map(|(k, v)| (k.clone(), native_value(v)))
+                .collect();
+            json!({ "M": entries })
+        }
+        AttributeValue::L(l) => {
+            json!({ "L": l.iter().map(native_value).collect::<Vec<_>>() })
+        }
+        AttributeValue::Ss(s) => json!({ "SS": s }),
+        AttributeValue::Ns(n) => json!({ "NS": n }),
+        AttributeValue::Bs(b) => {
+            json!({ "BS": b.iter().map(|x| BASE64.encode(x)).collect::<Vec<_>>() })
+        }
     }
 }
 
@@ -173,12 +330,12 @@ fn category_label(category: ViolationCategory) -> &'static str {
     }
 }
 
-fn expected_type_label(violation: &Violation) -> &'static str {
+fn expected_type_code(violation: &Violation) -> Option<&'static str> {
     match violation.expected_type {
-        Some(TypeCode::S) => "S",
-        Some(TypeCode::N) => "N",
-        Some(TypeCode::B) => "B",
-        None => "",
+        Some(TypeCode::S) => Some("S"),
+        Some(TypeCode::N) => Some("N"),
+        Some(TypeCode::B) => Some("B"),
+        None => None,
     }
 }
 
@@ -391,5 +548,217 @@ mod tests {
         );
         writer.write(&g).unwrap();
         writer.close().unwrap();
+    }
+
+    fn to_ndjson(groups: &[ItemViolations]) -> String {
+        let mut writer = NdjsonWriter::new(Vec::new());
+        for g in groups {
+            writer.write(g).unwrap();
+        }
+        String::from_utf8(writer.into_inner().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn no_violations_produces_empty_output() {
+        assert_eq!(to_ndjson(&[]), "");
+    }
+
+    #[test]
+    fn single_violation_record_is_byte_exact() {
+        let g = group(
+            key("userId", AttributeValue::S("u-1".to_string())),
+            Some(key("createdAt", AttributeValue::N("100".to_string()))),
+            vec![Violation {
+                target: Target::Gsi("GSI1".to_string()),
+                category: ViolationCategory::TypeMismatch,
+                attribute: Some("email".to_string()),
+                actual_value: Some("42".to_string()),
+                actual_type: Some("N".to_string()),
+                expected_type: Some(TypeCode::S),
+                size_bytes: None,
+            }],
+        );
+
+        assert_eq!(
+            to_ndjson(&[g]),
+            concat!(
+                r#"{"table":"users","detected_at":1750000000,"pk":{"userId":{"S":"u-1"}},"#,
+                r#""sk":{"createdAt":{"N":"100"}},"violations":[{"target":"GSI:GSI1","#,
+                r#""category":"type_mismatch","attribute":"email","actual_value":"42","#,
+                r#""actual_type":"N","expected_type":"S"}]}"#,
+                "\n"
+            )
+        );
+    }
+
+    #[test]
+    fn multiple_violations_stay_one_record() {
+        let g = group(
+            key("userId", AttributeValue::S("u-1".to_string())),
+            None,
+            vec![
+                Violation {
+                    target: Target::Lsi("LSI1".to_string()),
+                    category: ViolationCategory::MissingKey,
+                    attribute: Some("createdAt".to_string()),
+                    actual_value: None,
+                    actual_type: None,
+                    expected_type: Some(TypeCode::N),
+                    size_bytes: None,
+                },
+                Violation {
+                    target: Target::Ttl,
+                    category: ViolationCategory::SizeExceeded,
+                    attribute: Some("blob".to_string()),
+                    actual_value: None,
+                    actual_type: Some("B".to_string()),
+                    expected_type: None,
+                    size_bytes: Some(2049),
+                },
+            ],
+        );
+
+        let out = to_ndjson(&[g]);
+        assert_eq!(out.lines().count(), 1);
+        assert_eq!(
+            out,
+            concat!(
+                r#"{"table":"users","detected_at":1750000000,"pk":{"userId":{"S":"u-1"}},"#,
+                r#""violations":[{"target":"LSI:LSI1","category":"missing_key","#,
+                r#""attribute":"createdAt","expected_type":"N"},{"target":"TTL","#,
+                r#""category":"size_exceeded","attribute":"blob","actual_type":"B","#,
+                r#""size_bytes":2049}]}"#,
+                "\n"
+            )
+        );
+    }
+
+    #[test]
+    fn binary_key_uses_native_base64_shape() {
+        let g = group(
+            key("pk", AttributeValue::B(vec![1, 2, 3, 4])),
+            None,
+            vec![Violation {
+                target: Target::Gsi("GSI1".to_string()),
+                category: ViolationCategory::MissingKey,
+                attribute: Some("createdAt".to_string()),
+                actual_value: None,
+                actual_type: None,
+                expected_type: Some(TypeCode::N),
+                size_bytes: None,
+            }],
+        );
+
+        assert!(to_ndjson(&[g]).contains(r#""pk":{"pk":{"B":"AQIDBA=="}}"#));
+    }
+
+    #[test]
+    fn each_item_is_its_own_line() {
+        let a = group(
+            key("pk", AttributeValue::S("a".to_string())),
+            None,
+            vec![Violation {
+                target: Target::Ttl,
+                category: ViolationCategory::TtlMissing,
+                attribute: Some("expiresAt".to_string()),
+                actual_value: None,
+                actual_type: None,
+                expected_type: None,
+                size_bytes: None,
+            }],
+        );
+        let b = group(
+            key("pk", AttributeValue::S("b".to_string())),
+            None,
+            vec![Violation {
+                target: Target::Ttl,
+                category: ViolationCategory::TtlMissing,
+                attribute: Some("expiresAt".to_string()),
+                actual_value: None,
+                actual_type: None,
+                expected_type: None,
+                size_bytes: None,
+            }],
+        );
+
+        assert_eq!(to_ndjson(&[a, b]).lines().count(), 2);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.borrow().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn fan_out_writes_both_formats_in_one_pass() {
+        let csv_buf = SharedBuf::default();
+        let ndjson_buf = SharedBuf::default();
+        let mut fan: Box<dyn ExportWriter> = Box::new(FanOutWriter::new(vec![
+            Box::new(CsvWriter::new(csv_buf.clone()).unwrap()),
+            Box::new(NdjsonWriter::new(ndjson_buf.clone())),
+        ]));
+
+        let g = group(
+            key("userId", AttributeValue::S("u-1".to_string())),
+            None,
+            vec![
+                Violation {
+                    target: Target::Gsi("GSI1".to_string()),
+                    category: ViolationCategory::TypeMismatch,
+                    attribute: Some("email".to_string()),
+                    actual_value: Some("42".to_string()),
+                    actual_type: Some("N".to_string()),
+                    expected_type: Some(TypeCode::S),
+                    size_bytes: None,
+                },
+                Violation {
+                    target: Target::Ttl,
+                    category: ViolationCategory::TtlMalformed,
+                    attribute: Some("expiresAt".to_string()),
+                    actual_value: Some("-1".to_string()),
+                    actual_type: Some("N".to_string()),
+                    expected_type: None,
+                    size_bytes: None,
+                },
+            ],
+        );
+        fan.write(&g).unwrap();
+        fan.close().unwrap();
+
+        let csv = csv_buf.contents();
+        let ndjson = ndjson_buf.contents();
+
+        assert_eq!(csv.lines().skip(1).count(), 2, "one CSV row per violation");
+        assert_eq!(ndjson.lines().count(), 1, "one NDJSON record per item");
+        assert!(csv.contains("type_mismatch"));
+        assert!(csv.contains("ttl_malformed"));
+        assert!(ndjson.contains(r#""violations":["#));
+    }
+
+    #[test]
+    fn fan_out_over_no_writers_is_a_noop() {
+        let mut fan: Box<dyn ExportWriter> = Box::new(FanOutWriter::new(vec![]));
+        let g = group(
+            key("pk", AttributeValue::S("u-1".to_string())),
+            None,
+            vec![],
+        );
+        fan.write(&g).unwrap();
+        fan.close().unwrap();
     }
 }
