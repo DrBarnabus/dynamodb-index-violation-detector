@@ -5,10 +5,13 @@
 //! methods (navigate, toggle, edit); the top-level event loop maps terminal
 //! events onto them and drives transitions (task #24).
 
+mod app;
 mod completed;
 mod inflight;
 mod setup;
 
+#[allow(unused_imports)]
+pub use app::{App, Command};
 #[allow(unused_imports)]
 pub use completed::CompletedScreen;
 #[allow(unused_imports)]
@@ -16,7 +19,20 @@ pub use inflight::InFlightScreen;
 #[allow(unused_imports)]
 pub use setup::SetupScreen;
 
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
+
 use crate::rules::{Target, ViolationCategory};
+
+/// A centred `width`×`height` rectangle within `area`, for modal overlays.
+pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [row] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [cell] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(row);
+    cell
+}
 
 /// Every violation category in a stable display order, shared by the in-flight
 /// and completed screens so their counts panels are deterministic.

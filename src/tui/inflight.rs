@@ -9,12 +9,12 @@
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::{ALL_CATEGORIES, category_label};
+use super::{ALL_CATEGORIES, category_label, centered};
 use crate::state::StateSnapshot;
 
 /// Width of the inline per-segment progress bars, in cells.
@@ -195,16 +195,6 @@ fn section(title: &str) -> Line<'static> {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ))
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let [row] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [cell] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(row);
-    cell
 }
 
 fn fmt_progress(progress: f64) -> String {

@@ -142,6 +142,20 @@ impl SetupScreen {
         self.order.get(self.focus) == Some(&Focus::Start)
     }
 
+    /// True when the focused control is a text field, so the event loop routes
+    /// printable characters (including space) to editing rather than toggling.
+    pub fn focus_is_text(&self) -> bool {
+        matches!(
+            self.order[self.focus],
+            Focus::Table
+                | Focus::Region
+                | Focus::Segments
+                | Focus::RateLimit
+                | Focus::CsvPath
+                | Focus::NdjsonPath
+        )
+    }
+
     /// Flip the focused toggle. No-op on text fields and the Start button.
     pub fn toggle(&mut self) {
         match self.order[self.focus] {
