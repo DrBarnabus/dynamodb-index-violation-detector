@@ -1,13 +1,13 @@
-//! Config loader (PRD §8.7): TOML parsing and CLI-over-TOML precedence merge.
+//! Config loader: TOML parsing and CLI-over-TOML precedence merge.
 //!
 //! Three layers live here. [`ConfigFile`] is the faithful on-disk TOML
-//! representation (PRD §10): fields absent from the file stay `None` so the
+//! representation: fields absent from the file stay `None` so the
 //! precedence merge can distinguish "unset" from "set to the default value".
 //! [`CliArgs`] carries command-line overrides. [`load`] merges them into a
 //! [`ScanConfig`] — the resolved but *pre-schema* runtime config: scalars and
 //! export targets are fully resolved, while per-index and TTL intents are
 //! carried verbatim for [`crate::rules::RuleSet`] assembly once `DescribeTable`
-//! has run (PRD §8.8 / task #27). CLI overrides win over the file; the file
+//! has run. CLI overrides win over the file; the file
 //! wins over built-in defaults.
 
 use std::fmt;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::KeySchemaElement;
 
-/// The resolved, pre-schema runtime configuration for one scan (PRD §8.7).
+/// The resolved, pre-schema runtime configuration for one scan.
 ///
 /// Scalars and [`ExportConfig`] are fully resolved. The `gsi`/`lsi`/`ttl`
 /// intents are carried from the config file untouched — CLI flags never address
@@ -38,7 +38,7 @@ pub struct ScanConfig {
     pub ttl: Option<TtlSettings>,
 }
 
-/// Command-line overrides (PRD §6.5). Every field is optional and, when set,
+/// Command-line overrides. Every field is optional and, when set,
 /// takes precedence over the corresponding config-file value. The config file
 /// path itself is resolved by the caller and passed to [`load`] separately.
 #[derive(Debug, Clone, Default, Parser)]
@@ -64,7 +64,7 @@ pub struct CliArgs {
     pub rate_limit_percent: Option<u8>,
 }
 
-/// Export destinations and format toggles (PRD §6.6).
+/// Export destinations and format toggles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportConfig {
     pub csv: bool,
@@ -73,7 +73,7 @@ pub struct ExportConfig {
     pub ndjson_path: Option<PathBuf>,
 }
 
-/// The on-disk TOML config (PRD §10), deserialised verbatim.
+/// The on-disk TOML config, deserialised verbatim.
 ///
 /// Defaultable fields are `Option`: their absence is preserved so the precedence
 /// merge (CLI over file over built-in defaults) can tell an unset field from one
@@ -100,7 +100,7 @@ pub struct ConfigFile {
     pub lsi: Vec<LsiEntry>,
 }
 
-/// The `[scan]` table (PRD §6.2).
+/// The `[scan]` table.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanSettings {
@@ -110,7 +110,7 @@ pub struct ScanSettings {
     pub rate_limit_percent: Option<u8>,
 }
 
-/// The `[export]` table (PRD §6.6).
+/// The `[export]` table.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportSettings {
@@ -124,7 +124,7 @@ pub struct ExportSettings {
     pub ndjson_path: Option<PathBuf>,
 }
 
-/// The `[ttl]` table (PRD §6.1.3). The audited attribute name is discovered via
+/// The `[ttl]` table. The audited attribute name is discovered via
 /// `DescribeTable`, not declared here.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,7 +143,7 @@ pub struct TtlSettings {
     pub check_past_5_years: Option<bool>,
 }
 
-/// A `[[gsi]]` entry (PRD §6.1.1). Existing indexes carry only a name; the key
+/// A `[[gsi]]` entry. Existing indexes carry only a name; the key
 /// schema is discovered later. Hypothetical indexes declare `pk` (and optional
 /// `sk`) inline and set `hypothetical = true`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,7 +160,7 @@ pub struct GsiEntry {
     pub check_missing: bool,
 }
 
-/// A `[[lsi]]` entry (PRD §6.1.2). Only the missing-sort-key check is
+/// A `[[lsi]]` entry. Only the missing-sort-key check is
 /// configurable; the sort key schema is discovered via `DescribeTable`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,7 +170,7 @@ pub struct LsiEntry {
     pub check_missing: bool,
 }
 
-/// The largest legal `rate_limit_percent` value (PRD §6.2.3).
+/// The largest legal `rate_limit_percent` value.
 const MAX_RATE_LIMIT_PERCENT: u8 = 100;
 
 /// A failure to read, parse, validate or resolve configuration.
@@ -269,7 +269,7 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
-/// Parse a TOML config string into a validated [`ConfigFile`] (PRD §8.7).
+/// Parse a TOML config string into a validated [`ConfigFile`].
 ///
 /// Deserialises the document, then applies the structural rules that serde
 /// cannot express: non-empty names, unique index names, the hypothetical-vs-
@@ -334,7 +334,7 @@ impl ConfigFile {
     }
 }
 
-/// Load and resolve the runtime configuration (PRD §8.7).
+/// Load and resolve the runtime configuration.
 ///
 /// `path` is the config file to read, already resolved by the caller from
 /// `--config` or the `./scan.toml` default; `None` runs on CLI + defaults only.
@@ -360,7 +360,7 @@ pub fn load(path: Option<&Path>, cli: &CliArgs) -> Result<ScanConfig, ConfigErro
 /// Precedence is CLI over file over built-in defaults. Scalars are validated
 /// after resolution because CLI overrides bypass the file's own validation.
 /// Export paths are intentionally left unresolved (`None`) — timestamped default
-/// templating needs a clock and belongs to the save/shell layer (task #9).
+/// templating needs a clock and belongs to the save/shell layer.
 pub fn merge(file: Option<ConfigFile>, cli: &CliArgs) -> Result<ScanConfig, ConfigError> {
     let table = match cli
         .table
@@ -471,7 +471,7 @@ impl From<&ScanConfig> for ConfigFile {
     }
 }
 
-/// Serialise the current setup to a TOML config file (PRD §8.7, TUI Save config).
+/// Serialise the current setup to a TOML config file.
 ///
 /// Round-trips with [`load`]: `load(save(cfg))` yields an equal [`ScanConfig`].
 pub fn save(config: &ScanConfig, path: &Path) -> Result<(), ConfigError> {
@@ -484,7 +484,7 @@ pub fn save(config: &ScanConfig, path: &Path) -> Result<(), ConfigError> {
 }
 
 /// The default export path for one format: `violations-{table}-{timestamp}.{ext}`
-/// in the current directory (PRD §6.6).
+/// in the current directory.
 ///
 /// `timestamp` is supplied by the caller — a pure resolver has no clock — so the
 /// shell injects the real time and tests inject a fixed stamp.
@@ -492,8 +492,8 @@ pub fn default_export_path(table: &str, timestamp: &str, ext: &str) -> PathBuf {
     PathBuf::from(format!("violations-{table}-{timestamp}.{ext}"))
 }
 
-/// Fill any unset export path for an enabled format with the default template
-/// (PRD §6.6). Paths already set by the config or CLI are left untouched.
+/// Fill any unset export path for an enabled format with the default template.
+/// Paths already set by the config or CLI are left untouched.
 pub fn resolve_export_paths(config: &mut ScanConfig, timestamp: &str) {
     if config.export.csv && config.export.csv_path.is_none() {
         config.export.csv_path = Some(default_export_path(&config.table, timestamp, "csv"));

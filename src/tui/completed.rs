@@ -1,10 +1,10 @@
-//! Completed scan screen (PRD §6.3.5, MVP-trimmed).
+//! Completed scan screen.
 //!
 //! A static, browsable summary of a finished scan: final per-category counts,
 //! the paths of the export files, and a scrollable list of the last 1000
 //! violations (the aggregator's rolling window). Navigation moves a selection
 //! cursor over the list; the GetItem drill-in detail view and clipboard yank are
-//! deferred for MVP.
+//! deferred.
 
 use std::path::PathBuf;
 

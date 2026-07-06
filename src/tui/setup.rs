@@ -1,4 +1,4 @@
-//! Setup screen (PRD §6.3.3, MVP-trimmed).
+//! Setup screen.
 //!
 //! Renders the discovered table schema alongside the loaded config as an
 //! editable form: table name, region override, scan settings, export toggles
@@ -7,7 +7,7 @@
 //! deferred) and appear tagged alongside the discovered indexes.
 //!
 //! The screen holds the form state and exposes primitive mutations — navigate,
-//! toggle, edit — that the event loop (task #24) drives from key events. On
+//! toggle, edit — that the event loop drives from key events. On
 //! *Start scan* it projects the form back onto a [`ScanConfig`] via
 //! [`SetupScreen::to_scan_config`].
 
@@ -21,10 +21,10 @@ use crate::aws::TableDescription;
 use crate::config::{ExportConfig, GsiEntry, LsiEntry, ScanConfig, TtlSettings};
 use crate::domain::KeySchemaElement;
 
-/// The largest legal `rate_limit_percent` value (PRD §6.2.3).
+/// The largest legal `rate_limit_percent` value.
 const MAX_RATE_LIMIT_PERCENT: u8 = 100;
 
-/// The TTL sub-checks in display order (PRD §6.1.3). Index positions are
+/// The TTL sub-checks in display order. Index positions are
 /// referenced by [`Focus::TtlCheck`].
 const TTL_CHECK_LABELS: [&str; 5] = [
     "Missing attribute",
@@ -68,7 +68,7 @@ struct GsiRow {
     key_desc: String,
 }
 
-/// An LSI row. Only `check_missing` is editable (PRD §6.1.2).
+/// An LSI row. Only `check_missing` is editable.
 #[derive(Debug, Clone)]
 struct LsiRow {
     entry: LsiEntry,
@@ -94,7 +94,7 @@ pub struct SetupScreen {
 
 impl SetupScreen {
     /// Build the form from a loaded config and the table schema discovered via
-    /// `DescribeTable` (PRD §6.3.3).
+    /// `DescribeTable`.
     ///
     /// Discovered GSIs/LSIs seed the rows; a config `check_missing` intent for a
     /// matching name is carried over. Hypothetical GSIs from the config are
@@ -137,7 +137,7 @@ impl SetupScreen {
     }
 
     /// True when the *Start scan* button is focused, so the event loop can turn
-    /// an `Enter` into a `StartScan` command (task #24).
+    /// an `Enter` into a `StartScan` command.
     pub fn is_start_focused(&self) -> bool {
         self.order.get(self.focus) == Some(&Focus::Start)
     }
@@ -269,7 +269,7 @@ impl SetupScreen {
         })
     }
 
-    /// Draw the form into `area` (PRD §8.6).
+    /// Draw the form into `area`.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default().borders(Borders::ALL).title(" Scan setup ");
         let inner = block.inner(area);

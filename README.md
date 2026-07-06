@@ -76,8 +76,8 @@ Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable
 ## Configuration
 
 Scan setup is captured in a TOML file (default `./scan.toml`, override with
-`--config`). The setup screen can both load from and save to one. See `PRD.md`
-§10 for the full schema; a minimal example:
+`--config`). The setup screen can both load from and save to one. A minimal
+example:
 
 ```toml
 table = "users"

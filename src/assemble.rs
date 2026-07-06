@@ -1,4 +1,4 @@
-//! RuleSet assembly (PRD §8.8, task #27): merge discovered schema with config.
+//! RuleSet assembly: merge discovered schema with config.
 //!
 //! Sits between the AWS facade and the rule engine. [`assemble`] takes a
 //! [`TableDescription`] discovered via `DescribeTable` and the pre-schema
@@ -64,8 +64,8 @@ impl fmt::Display for AssembleError {
 
 impl std::error::Error for AssembleError {}
 
-/// Default TTL sub-toggles when the config leaves one unset (PRD §10 appendix).
-/// Only the past-5-years check is off by default, matching the appendix example.
+/// Default TTL sub-toggles when the config leaves one unset.
+/// Only the past-5-years check is off by default.
 const TTL_DEFAULT_MISSING: bool = true;
 const TTL_DEFAULT_WRONG_TYPE: bool = true;
 const TTL_DEFAULT_MS_MAGNITUDE: bool = true;

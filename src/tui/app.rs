@@ -1,10 +1,10 @@
-//! Screen state machine and key dispatch (PRD §6.3.1, §6.3.6 / §8.6).
+//! Screen state machine and key dispatch.
 //!
 //! [`App`] owns the current screen and maps key events onto it, returning a
 //! [`Command`] for shell-level actions (start/cancel a scan, save config, quit)
 //! while handling navigation, toggles, and editing internally. The flow is
 //! linear — Setup → In-flight → Completed — with no back-navigation from the
-//! completed screen (PRD §6.3.1); the shell (task #25) drives the forward
+//! completed screen; the shell drives the forward
 //! transitions as the scan starts and finishes.
 
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use super::{CompletedScreen, InFlightScreen, SetupScreen, centered};
 use crate::state::StateSnapshot;
 
-/// A shell-level action requested by the user (PRD §8.6). Navigation, toggles,
+/// A shell-level action requested by the user. Navigation, toggles,
 /// and text editing are handled inside [`App`] and never surface as commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -41,8 +41,8 @@ pub struct App {
 }
 
 impl App {
-    /// Start on the setup screen (PRD §6.3.1); the launch/profile picker is
-    /// skipped when the scan is already targeted via config or CLI (§6.3.2).
+    /// Start on the setup screen; the launch/profile picker is
+    /// skipped when the scan is already targeted via config or CLI.
     pub fn new(setup: SetupScreen) -> Self {
         Self {
             screen: Screen::Setup(Box::new(setup)),

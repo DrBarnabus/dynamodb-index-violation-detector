@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Application shell (PRD §8.8): the thin wiring that binds every module into a
+//! Application shell: the thin wiring that binds every module into a
 //! running program. `main` resolves configuration, builds the AWS client,
 //! discovers the table schema, then drives the TUI event loop. On *Start scan*
 //! it assembles the [`RuleSet`], opens the export writers and fans a parallel
@@ -122,7 +122,7 @@ struct ScanContext {
 }
 
 impl Shell {
-    /// The TUI event loop (PRD §6.3.1). A single task interleaves terminal input,
+    /// The TUI event loop. A single task interleaves terminal input,
     /// scanned-item processing and periodic redraws via `select!`, so the export
     /// writers never need to cross a task boundary. Redraws are driven by the
     /// frame ticker rather than per item, keeping a fast scan from starving the
@@ -172,7 +172,7 @@ impl Shell {
         Ok(())
     }
 
-    /// Apply one shell-level [`Command`] from the TUI (PRD §8.6).
+    /// Apply one shell-level [`Command`] from the TUI.
     async fn dispatch(
         &mut self,
         command: Command,
@@ -205,7 +205,7 @@ impl Shell {
         }
     }
 
-    /// Build the scan pipeline for the setup screen's current form (PRD §8.8):
+    /// Build the scan pipeline for the setup screen's current form:
     /// resolve the config, re-discover the table if its name changed, assemble
     /// the [`RuleSet`], open the export writers and fan out the scan.
     async fn start_scan(&mut self, app: &App) -> Result<ActiveScan, ErrorModal> {
@@ -256,7 +256,7 @@ impl Shell {
         })
     }
 
-    /// Persist the setup form to the resolved config path (PRD §6.3.3 Save).
+    /// Persist the setup form to the resolved config path.
     fn save_config(&self, app: &App) -> Result<(), ErrorModal> {
         let setup = app.setup().ok_or_else(|| {
             ErrorModal::message("Cannot save config", "no setup screen is active")
@@ -269,7 +269,7 @@ impl Shell {
         config::save(&config, &self.save_path).map_err(ErrorModal::from)
     }
 
-    /// Fold one scanned item into the aggregator and export writer (PRD §6.2.1).
+    /// Fold one scanned item into the aggregator and export writer.
     fn consume(
         &self,
         item: ScannedItem,
@@ -288,7 +288,7 @@ impl Shell {
     }
 
     /// Close the export writers and move the app to the completed screen once
-    /// every segment has terminated (PRD §6.3.5).
+    /// every segment has terminated.
     fn finish_scan(
         &self,
         app: &mut App,
@@ -308,7 +308,7 @@ impl Shell {
     }
 
     /// Render one frame: the current screen, the live snapshot while a scan is
-    /// running, and any terminal-error modal on top (PRD §6.3.7).
+    /// running, and any terminal-error modal on top.
     fn draw(
         &self,
         terminal: &mut DefaultTerminal,
@@ -349,7 +349,7 @@ impl Shell {
 }
 
 /// Evaluate one scanned item and stream any violations to disk and the
-/// aggregator (PRD §8.1 / §8.5). Shared by the event loop and the integration
+/// aggregator. Shared by the event loop and the integration
 /// test so both exercise the identical item pipeline.
 fn process_item(
     scanned: &ScannedItem,
@@ -382,7 +382,7 @@ fn process_item(
 }
 
 /// Group an item's violations for export, extracting the table's own primary key
-/// (PRD §6.6) so the detail view can later re-fetch the item by key.
+/// so the detail view can later re-fetch the item by key.
 fn build_group(
     table: &str,
     table_key: &TableKeySchema,
@@ -430,7 +430,7 @@ async fn next_scanned(scan: &mut Option<ActiveScan>) -> Option<Result<ScannedIte
     }
 }
 
-/// Open the configured export writers (PRD §6.6). Paths are already resolved to
+/// Open the configured export writers. Paths are already resolved to
 /// their defaults by [`config::resolve_export_paths`]; each enabled format is
 /// created and reported so the completed screen can show where results landed.
 fn build_writer(
@@ -480,7 +480,7 @@ fn resolve_config_path(cli: &CliArgs) -> Option<PathBuf> {
 }
 
 /// Current wall-clock time as Unix epoch seconds, used to stamp violations and
-/// as the TTL "now" (PRD §6.1.3).
+/// as the TTL "now".
 fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -488,7 +488,7 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// A filesystem-safe timestamp for default export filenames (PRD §6.6). Epoch
+/// A filesystem-safe timestamp for default export filenames. Epoch
 /// seconds avoid a calendar-formatting dependency while staying unique per scan.
 fn timestamp() -> String {
     now_epoch_secs().to_string()
@@ -521,7 +521,7 @@ fn spawn_input_reader() -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
     (rx, shutdown)
 }
 
-/// A terminal-error modal (PRD §6.3.7): headline, optional SDK code, message and
+/// A terminal-error modal: headline, optional SDK code, message and
 /// a suggested remediation, dismissed by any keypress.
 struct ErrorModal {
     title: String,

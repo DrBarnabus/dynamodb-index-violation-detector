@@ -1,9 +1,9 @@
-//! In-flight scan screen (PRD §6.3.4, MVP-trimmed).
+//! In-flight scan screen.
 //!
 //! Renders live scan progress from a [`StateSnapshot`]: a fixed header of
 //! aggregate stats over a detailed body of per-segment progress bars and
 //! per-category violation counts. `Ctrl+C` raises a cancel-confirmation modal
-//! the screen owns; the event loop (task #24) turns a confirmed cancel into a
+//! the screen owns; the event loop turns a confirmed cancel into a
 //! `CancelScan` command. The live-violations feed swap-view is deferred.
 
 use std::time::Duration;
@@ -32,7 +32,7 @@ impl InFlightScreen {
         Self::default()
     }
 
-    /// Raise the cancel-confirmation modal (`Ctrl+C`, PRD §6.3.4).
+    /// Raise the cancel-confirmation modal (`Ctrl+C`).
     pub fn request_cancel(&mut self) {
         self.confirming_cancel = true;
     }

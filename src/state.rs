@@ -1,4 +1,4 @@
-//! State/progress aggregator (PRD §8.5): counters, rolling window, ETA.
+//! State/progress aggregator: counters, rolling window, ETA.
 //!
 //! [`Aggregator`] is the single shared sink every scan worker and the TUI touch.
 //! Segment workers call [`record_item`](Aggregator::record_item) and
@@ -7,13 +7,13 @@
 //! [`snapshot`](Aggregator::snapshot) each frame. Counts are atomic; only the
 //! rolling window, per-category tallies and rate history take a short lock.
 //!
-//! Memory is bounded regardless of violation count (PRD §7): the feed retains a
+//! Memory is bounded regardless of violation count: the feed retains a
 //! fixed rolling window of the last [`ROLLING_WINDOW_CAP`] violations and tallies
 //! are O(categories).
 //!
 //! Rates are trailing-window, sampled lazily inside `snapshot` from the cumulative
 //! counters, so the hot record paths stay lock-light. The [`Clock`] is injectable
-//! so tests can drive time-derived fields deterministically (PRD §8.5).
+//! so tests can drive time-derived fields deterministically.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::rules::{Violation, ViolationCategory};
 
-/// Fixed cap on the in-memory violation feed (PRD §6.3.4 / §7).
+/// Fixed cap on the in-memory violation feed.
 pub const ROLLING_WINDOW_CAP: usize = 1000;
 
 /// Trailing window over which items/sec and RCU/sec are averaged.
@@ -42,7 +42,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Thread-safe scan progress and violation aggregator (PRD §8.5).
+/// Thread-safe scan progress and violation aggregator.
 pub struct Aggregator {
     clock: Arc<dyn Clock>,
     started_at: Instant,
@@ -72,7 +72,7 @@ struct RateSample {
     rcu: f64,
 }
 
-/// An immutable view of scan state for one render frame (PRD §6.3.4).
+/// An immutable view of scan state for one render frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateSnapshot {
     pub items_scanned: u64,
@@ -91,7 +91,7 @@ pub struct StateSnapshot {
 
 impl Aggregator {
     /// Build an aggregator for a scan over `segments` parallel segments, sized
-    /// against the table's approximate `item_count` (PRD §6.2.4) with an
+    /// against the table's approximate `item_count` with an
     /// injectable clock. The scan start is anchored to `clock.now()`.
     pub fn new(segments: u32, item_count: u64, clock: Arc<dyn Clock>) -> Self {
         let started_at = clock.now();
@@ -118,7 +118,7 @@ impl Aggregator {
         Self::new(segments, item_count, Arc::new(SystemClock))
     }
 
-    /// Record one item read from `segment` (PRD §8.5). Feeds both the aggregate
+    /// Record one item read from `segment`. Feeds both the aggregate
     /// count and the per-segment progress that the in-flight bars render.
     pub fn record_item(&self, segment: u32) {
         self.total_items.fetch_add(1, Ordering::Relaxed);
@@ -139,7 +139,7 @@ impl Aggregator {
         }
     }
 
-    /// Record read capacity consumed by one page (PRD §6.2.3). The `segment` is
+    /// Record read capacity consumed by one page. The `segment` is
     /// part of the aggregator contract; the header meters only the aggregate.
     pub fn record_consumed(&self, _segment: u32, rcu: f64) {
         *self
@@ -150,7 +150,7 @@ impl Aggregator {
 
     /// A coherent snapshot for the current render frame. Rates are averaged over
     /// the trailing [`RATE_WINDOW`], sampled from the live cumulative counters;
-    /// the ETA is best-effort from the approximate `item_count` (PRD §6.2.4).
+    /// the ETA is best-effort from the approximate `item_count`.
     pub fn snapshot(&self) -> StateSnapshot {
         let now = self.clock.now();
         let items_scanned = self.total_items.load(Ordering::Relaxed);

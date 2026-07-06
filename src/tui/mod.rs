@@ -1,9 +1,9 @@
-//! TUI renderer (PRD §8.6): ratatui screens, keybindings, event dispatch.
+//! TUI renderer: ratatui screens, keybindings, event dispatch.
 //!
 //! Each screen owns a self-contained state model and a `render` method. The
 //! screens carry the editable/browsable data and expose primitive mutation
 //! methods (navigate, toggle, edit); the top-level event loop maps terminal
-//! events onto them and drives transitions (task #24).
+//! events onto them and drives transitions.
 
 mod app;
 mod completed;
@@ -61,7 +61,7 @@ pub(super) fn category_label(category: ViolationCategory) -> &'static str {
     }
 }
 
-/// The display name of a violation's target bucket (PRD §6.1.4 hierarchy).
+/// The display name of a violation's target bucket.
 pub(super) fn target_label(target: &Target) -> String {
     match target {
         Target::Gsi(name) => format!("GSI {name}"),

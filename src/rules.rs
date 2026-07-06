@@ -1,4 +1,4 @@
-//! Violation rule engine (PRD §8.1): pure, synchronous key-schema and TTL checks.
+//! Violation rule engine: pure, synchronous key-schema and TTL checks.
 //!
 //! Owns the violation contract ([`Violation`], [`ItemViolations`]) and the rule
 //! inputs ([`RuleSet`] and its per-index rules).
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{AttributeValue, Item, KeyAttribute, KeySchemaElement, TypeCode};
 
-/// The target bucket a violation belongs to (PRD §6.1.4 output hierarchy).
+/// The target bucket a violation belongs to in the output hierarchy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
     Gsi(String),
@@ -40,7 +40,7 @@ pub struct Violation {
     pub size_bytes: Option<usize>,
 }
 
-/// All violations detected against one item, grouped for export (PRD §6.6).
+/// All violations detected against one item, grouped for export.
 ///
 /// Carries the table's own primary key (used to re-fetch the item in the detail
 /// view) and the full item for NDJSON and full-JSON clipboard copy.
@@ -54,7 +54,7 @@ pub struct ItemViolations {
     pub detected_at: i64,
 }
 
-/// The resolved set of checks a single scan will run (PRD §8.1 input).
+/// The resolved set of checks a single scan will run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleSet {
     pub table: String,
@@ -74,7 +74,7 @@ pub struct GsiRule {
 }
 
 /// An LSI to check. The partition key equals the table's; only the sort key can
-/// be missing, so type and size checks do not apply (PRD §6.1.2).
+/// be missing, so type and size checks do not apply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LsiRule {
     pub name: String,
@@ -82,7 +82,7 @@ pub struct LsiRule {
     pub check_missing: bool,
 }
 
-/// TTL checks for the scan (PRD §6.1.3).
+/// TTL checks for the scan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TtlRule {
     pub attribute: String,
@@ -93,7 +93,7 @@ pub struct TtlRule {
     pub check_past_5_years: bool,
 }
 
-/// Check one item against every enabled rule in a single pass (PRD §8.1).
+/// Check one item against every enabled rule in a single pass.
 ///
 /// The item is read once and evaluated against every GSI, LSI and the TTL rule.
 /// `now_epoch_secs` is snapshotted once at scan start and threaded through to the
@@ -121,7 +121,7 @@ const PARTITION_KEY_MAX_BYTES: usize = 2048;
 /// Maximum byte size of a sort key value (DynamoDB index key limit).
 const SORT_KEY_MAX_BYTES: usize = 1024;
 
-/// Check one item against one GSI rule (PRD §6.1.1).
+/// Check one item against one GSI rule.
 ///
 /// Type mismatch and size violations are always evaluated; a missing key
 /// attribute is only reported when the rule opts in via `check_missing`. Applies
@@ -251,7 +251,7 @@ fn key_size_bytes(value: &AttributeValue) -> Option<usize> {
     }
 }
 
-/// Check one item against one LSI rule (PRD §6.1.2).
+/// Check one item against one LSI rule.
 ///
 /// Only a missing sort key is reported, and only when the rule opts in via
 /// `check_missing`. LSI partition keys equal the table's, and DynamoDB validates
@@ -286,7 +286,7 @@ enum TtlClass {
     PastFiveYears,
 }
 
-/// Check one item against the TTL rule (PRD §6.1.3).
+/// Check one item against the TTL rule.
 ///
 /// A present value is classified exactly once; the corresponding violation is
 /// reported only when its sub-toggle is enabled. `now_epoch_secs` anchors the

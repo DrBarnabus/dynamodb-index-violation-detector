@@ -1,23 +1,22 @@
-//! Scan driver (PRD §8.3): parallel segment fan-out, pagination, rate limiting.
+//! Scan driver: parallel segment fan-out, pagination, rate limiting.
 //!
-//! [`run_scan`] fans a table scan out across `config.segments` parallel segments
-//! (PRD §6.2.1/§6.2.2), one Tokio task per segment, each paginating its own
+//! [`run_scan`] fans a table scan out across `config.segments` parallel segments,
+//! one Tokio task per segment, each paginating its own
 //! segment via `LastEvaluatedKey`. Items stream back over a bounded channel so a
 //! slow consumer applies back-pressure to the workers rather than letting them
 //! run ahead unboundedly.
 //!
 //! When the table is provisioned and a `rate_limit_percent` is set, a shared
 //! token bucket paces every worker against a percentage of the snapshotted
-//! provisioned RCU (PRD §6.2.3). On-demand tables and an unset percentage run
+//! provisioned RCU. On-demand tables and an unset percentage run
 //! unlimited. Every `Scan` requests `ReturnConsumedCapacity=TOTAL` and the
 //! consumed units are aggregated into a running total the TUI header samples.
 //!
-//! Cancel (PRD §6.3.4) is cooperative: [`ScanStream::cancel`] flips a shared
+//! Cancel is cooperative: [`ScanStream::cancel`] flips a shared
 //! signal, workers stop issuing scans, fetched items drain, then the stream ends.
 //!
-//! The PRD sketches an `impl Stream`; [`ScanStream`] is a channel-backed
-//! equivalent that keeps the crate off an async-stream dependency. Reads are
-//! eventually consistent (the SDK default).
+//! [`ScanStream`] is a channel-backed stream that keeps the crate off an
+//! async-stream dependency. Reads are eventually consistent (the SDK default).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +30,7 @@ use crate::config::ScanConfig;
 use crate::domain::Item;
 
 /// One item read from the scan, tagged with the segment that produced it so the
-/// state aggregator (PRD §8.5) can attribute per-segment progress.
+/// state aggregator can attribute per-segment progress.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScannedItem {
     pub segment: u32,
@@ -42,7 +41,7 @@ pub struct ScannedItem {
 /// Bounds memory and gives the consumer back-pressure over the fan-out.
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// The RCU-per-second ceiling for a scan (PRD §6.2.3), or `None` for unlimited.
+/// The RCU-per-second ceiling for a scan, or `None` for unlimited.
 ///
 /// Unlimited when the table is on-demand (`provisioned_rcu` is `None`) or no
 /// `rate_limit_percent` is set. Otherwise the configured percentage of the
@@ -55,7 +54,7 @@ pub fn rcu_ceiling(provisioned_rcu: Option<u64>, rate_limit_percent: Option<u8>)
 }
 
 /// Fan a scan out across `config.segments` parallel segments and stream the
-/// items back (PRD §6.2.1/§6.2.2).
+/// items back.
 ///
 /// `provisioned_rcu` is the capacity snapshotted from `DescribeTable` at scan
 /// start (`None` for on-demand); combined with `config.rate_limit_percent` it
@@ -64,7 +63,7 @@ pub fn rcu_ceiling(provisioned_rcu: Option<u64>, rate_limit_percent: Option<u8>)
 /// arrive from any segment; a segment failure surfaces as an `Err` and stops
 /// only that segment.
 ///
-/// Cancel (PRD §6.3.4) via [`ScanStream::cancel`] or a detached
+/// Cancel via [`ScanStream::cancel`] or a detached
 /// [`CancelHandle`]: workers stop issuing scans, items already fetched drain to
 /// the consumer, and the stream then terminates cleanly (`next` returns `None`).
 pub fn run_scan(
@@ -199,13 +198,13 @@ impl ScanStream {
         self.rx.recv().await
     }
 
-    /// Total read capacity units consumed so far across every segment (PRD
-    /// §6.2.3), sampled live for the in-flight header.
+    /// Total read capacity units consumed so far across every segment,
+    /// sampled live for the in-flight header.
     pub fn consumed_rcu(&self) -> f64 {
         *self.consumed.lock().expect("consumed total not poisoned")
     }
 
-    /// Signal every segment to stop (PRD §6.3.4). Fetched items still drain;
+    /// Signal every segment to stop. Fetched items still drain;
     /// keep calling [`next`](ScanStream::next) until it returns `None`.
     pub fn cancel(&self) {
         self.cancel.cancel();
@@ -226,7 +225,7 @@ impl Drop for ScanStream {
     }
 }
 
-/// A cloneable handle that signals a running scan to stop (PRD §6.3.4).
+/// A cloneable handle that signals a running scan to stop.
 #[derive(Clone)]
 pub struct CancelHandle(watch::Sender<bool>);
 

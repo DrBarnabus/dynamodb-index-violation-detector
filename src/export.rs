@@ -1,8 +1,8 @@
-//! Export writer (PRD §8.4): streaming CSV and NDJSON output.
+//! Export writer: streaming CSV and NDJSON output.
 //!
 //! Writers consume [`ItemViolations`] groups and stream them to disk as they
 //! arrive, flushing after every group so a partial file left by a crash or
-//! cancel (PRD §6.6) contains everything scanned up to that point.
+//! cancel contains everything scanned up to that point.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -60,7 +60,7 @@ impl From<serde_json::Error> for ExportError {
     }
 }
 
-/// A streaming sink for violation groups (PRD §8.4).
+/// A streaming sink for violation groups.
 ///
 /// One [`write`](ExportWriter::write) call per item; a single item with multiple
 /// violations expands to multiple output records for CSV. [`close`](ExportWriter::close)
@@ -71,7 +71,7 @@ pub trait ExportWriter {
     fn close(self: Box<Self>) -> Result<(), ExportError>;
 }
 
-/// One CSV row per violation (PRD §6.6). The item's `pk`/`sk` are repeated across
+/// One CSV row per violation. The item's `pk`/`sk` are repeated across
 /// every row belonging to the same item; binary key values are base64-encoded.
 pub struct CsvWriter<W: Write> {
     writer: csv::Writer<W>,
@@ -152,7 +152,7 @@ impl<W: Write> ExportWriter for CsvWriter<W> {
     }
 }
 
-/// One JSON object per item, one per line (PRD §6.6). An item with multiple
+/// One JSON object per item, one per line. An item with multiple
 /// violations stays a single record carrying a `violations` array; table and
 /// timestamp are duplicated per record so each line is self-contained. PK/SK are
 /// emitted in native DynamoDB JSON shape, with binary base64-encoded.
@@ -195,7 +195,7 @@ impl<W: Write> ExportWriter for NdjsonWriter<W> {
 }
 
 /// Fans a single stream of groups out to several writers, so CSV and NDJSON are
-/// produced in one scan pass (PRD §6.6). Each wrapped format is toggled by
+/// produced in one scan pass. Each wrapped format is toggled by
 /// simply omitting its writer from the set.
 pub struct FanOutWriter {
     writers: Vec<Box<dyn ExportWriter>>,

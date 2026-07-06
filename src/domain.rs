@@ -1,4 +1,4 @@
-//! Ownerless value vocabulary shared across every module (PRD §8).
+//! Ownerless value vocabulary shared across every module.
 //!
 //! Only the foundational data types that have no single owning module live here:
 //! items, attribute values, type codes and key-schema elements. Contract types

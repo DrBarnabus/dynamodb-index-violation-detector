@@ -1,4 +1,4 @@
-//! AWS client facade (PRD §8.2): DynamoClient trait over the SDK.
+//! AWS client facade: DynamoClient trait over the SDK.
 //!
 //! Owns the discovered-schema contract ([`TableDescription`] and its parts),
 //! produced from `DescribeTable`, and the request/response vocabulary the scan
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{AttributeValue, Item, KeySchemaElement, TypeCode};
 
-/// A table's schema as discovered via `DescribeTable` (PRD §8.2).
+/// A table's schema as discovered via `DescribeTable`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDescription {
     pub name: String,
@@ -56,7 +56,7 @@ pub struct TtlDescription {
     pub enabled: bool,
 }
 
-/// A single segment page request for a parallel `Scan` (PRD §6.2.2).
+/// A single segment page request for a parallel `Scan`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanRequest {
     pub table: String,
@@ -80,7 +80,7 @@ pub struct ScanResponse {
     pub consumed_rcu: Option<f64>,
 }
 
-/// A point read of a single item by its primary key (PRD §6.3.5 drill-in).
+/// A point read of a single item by its primary key.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetItemRequest {
     pub table: String,
@@ -88,7 +88,7 @@ pub struct GetItemRequest {
     pub key: Item,
 }
 
-/// The AWS facade over DynamoDB (PRD §8.2).
+/// The AWS facade over DynamoDB.
 ///
 /// The SDK's `AttributeValue` is converted to [`crate::domain::AttributeValue`]
 /// at this boundary; consumers hold `Arc<dyn DynamoClient>` and stay
@@ -106,7 +106,7 @@ pub trait DynamoClient: Send + Sync {
 }
 
 /// A failure from the AWS facade, carrying the SDK error code for display
-/// (PRD §6.3.7) and a [`kind`](AwsError::kind) so the TUI can decide between a
+/// and a [`kind`](AwsError::kind) so the TUI can decide between a
 /// terminal modal and silent retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsError {
@@ -132,7 +132,7 @@ pub enum AwsErrorKind {
 }
 
 impl AwsError {
-    /// A one-line remediation hint for the terminal error modal (PRD §6.3.7).
+    /// A one-line remediation hint for the terminal error modal.
     /// `None` for [`AwsErrorKind::Other`], which has no generic fix.
     pub fn remediation(&self) -> Option<&'static str> {
         match self.kind {
@@ -171,7 +171,7 @@ pub struct RealDynamoClient {
 impl RealDynamoClient {
     /// Builds a client from the default credential provider chain (env, shared
     /// config, SSO, IMDS, container), honouring an optional profile and region
-    /// override (PRD §6.4). Region falls back to the profile/environment when
+    /// override. Region falls back to the profile/environment when
     /// `None`.
     pub async fn new(profile: Option<&str>, region: Option<&str>) -> Self {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
@@ -398,7 +398,7 @@ fn classify_code(code: &str) -> AwsErrorKind {
 }
 
 /// Maps a raw `DescribeTable` result (plus separately-fetched TTL) into the
-/// crate's [`TableDescription`] (PRD §6.3.3): index key schemas resolved to
+/// crate's [`TableDescription`]: index key schemas resolved to
 /// scalar type codes, provisioned RCU snapshotted (`None` for on-demand) and
 /// the approximate item count for progress estimation.
 fn map_table_description(
@@ -532,7 +532,7 @@ fn malformed(message: String) -> AwsError {
 
 #[cfg(test)]
 pub mod mock {
-    //! A scriptable [`DynamoClient`] for unit tests (PRD §8.2/§8.3).
+    //! A scriptable [`DynamoClient`] for unit tests.
     //!
     //! Scan responses are queued per segment and popped in call order, so tests
     //! drive pagination, throttling and partial failures by scripting the queue.
