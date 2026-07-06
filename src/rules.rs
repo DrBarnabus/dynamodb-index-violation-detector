@@ -16,7 +16,7 @@ pub enum Target {
 }
 
 /// The category of a detected violation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ViolationCategory {
     TypeMismatch,
     SizeExceeded,
