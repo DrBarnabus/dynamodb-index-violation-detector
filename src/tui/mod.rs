@@ -5,7 +5,10 @@
 //! methods (navigate, toggle, edit); the top-level event loop maps terminal
 //! events onto them and drives transitions (task #24).
 
+mod inflight;
 mod setup;
 
+#[allow(unused_imports)]
+pub use inflight::InFlightScreen;
 #[allow(unused_imports)]
 pub use setup::SetupScreen;
