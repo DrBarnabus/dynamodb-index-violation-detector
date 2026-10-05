@@ -255,17 +255,7 @@ mod tests {
             .draw(|frame| screen.render(snap, frame, frame.area()))
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let area = buffer.area;
-        let mut text = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-
-        text
+        crate::tui::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
