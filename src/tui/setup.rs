@@ -90,8 +90,8 @@ struct LsiRow {
     key_desc: String,
 }
 
-/// The config's per-index and TTL intents, re-applied whenever a table is
-/// described so a later table choice still honours them.
+/// The per-index and TTL intents, seeded from the config and updated from the
+/// form rows before each rebuild, so a later table choice still honours them.
 struct Intents {
     gsi: Vec<GsiEntry>,
     lsi: Vec<LsiEntry>,
@@ -200,11 +200,30 @@ impl SetupScreen {
     fn rebuild_rows(&mut self, description: Option<&TableDescription>) {
         let focused = self.order.get(self.focus).copied();
 
+        self.capture_rows();
         self.gsis = build_gsi_rows(&self.intents.gsi, description);
         self.lsis = build_lsi_rows(&self.intents.lsi, description);
         self.ttl = build_ttl_row(self.intents.ttl.as_ref(), description);
         self.rebuild_order(focused);
         self.loaded_table = description.map(|d| d.name.clone());
+    }
+
+    /// Fold the rows' current settings into the intents, so edits survive the
+    /// rows being rebuilt for another (or the same) table.
+    fn capture_rows(&mut self) {
+        for row in &self.gsis {
+            upsert(&mut self.intents.gsi, row.entry.clone(), |a, b| {
+                a.name == b.name && a.hypothetical == b.hypothetical
+            });
+        }
+        for row in &self.lsis {
+            upsert(&mut self.intents.lsi, row.entry.clone(), |a, b| {
+                a.name == b.name
+            });
+        }
+        if let Some(ttl) = &self.ttl {
+            self.intents.ttl = Some(ttl.to_settings());
+        }
     }
 
     fn rebuild_order(&mut self, focused: Option<Focus>) {
@@ -319,7 +338,6 @@ impl SetupScreen {
         };
 
         self.gsi_form = None;
-        self.intents.gsi.push(entry.clone());
         self.gsis.push(hypothetical_row(entry));
         self.rebuild_order(Some(Focus::Gsi(self.gsis.len() - 1)));
     }
@@ -628,6 +646,14 @@ impl LineBuilder {
         }
 
         self.lines.push(line);
+    }
+}
+
+/// Replace the entry `same` matches, or append `entry` when none does.
+fn upsert<T>(entries: &mut Vec<T>, entry: T, same: impl Fn(&T, &T) -> bool) {
+    match entries.iter_mut().find(|existing| same(existing, &entry)) {
+        Some(existing) => *existing = entry,
+        None => entries.push(entry),
     }
 }
 
@@ -1268,6 +1294,52 @@ mod tests {
 
         screen.unload_table();
         assert!(screen.gsis.is_empty(), "removal reaches the intents");
+    }
+
+    #[test]
+    fn toggled_checks_survive_reloading_the_table() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        for focus in [
+            Focus::Gsi(0),
+            Focus::Gsi(1),
+            Focus::Lsi(0),
+            Focus::TtlEnabled,
+            Focus::TtlCheck(4),
+        ] {
+            focus_on(&mut screen, focus);
+            screen.toggle();
+        }
+
+        screen.load_table(&description());
+
+        assert!(!screen.gsis[0].entry.check_missing);
+        assert!(screen.gsis[1].entry.check_missing);
+        assert!(!screen.lsis[0].entry.check_missing);
+        let ttl = screen.ttl.as_ref().unwrap();
+        assert!(!ttl.enabled);
+        assert!(ttl.checks[4]);
+    }
+
+    #[test]
+    fn toggled_checks_survive_switching_to_a_table_without_the_index() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        focus_on(&mut screen, Focus::Lsi(0));
+        screen.toggle();
+        focus_on(&mut screen, Focus::TtlCheck(0));
+        screen.toggle();
+
+        let mut other = description();
+        other.name = "orders".to_string();
+        other.gsis.clear();
+        other.lsis.clear();
+        other.ttl = None;
+        screen.load_table(&other);
+        screen.unload_table();
+        screen.load_table(&description());
+
+        assert!(!screen.lsis[0].entry.check_missing);
+        assert!(!screen.ttl.as_ref().unwrap().checks[0]);
+        assert!(screen.gsis[0].entry.check_missing, "untouched intent kept");
     }
 
     #[test]
