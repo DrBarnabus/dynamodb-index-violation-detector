@@ -17,6 +17,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
 
 [dev-dependencies]
+criterion = "0.8.2"
 testcontainers = "0.28.0"
 tokio = { version = "1.52.3", features = ["test-util"] }
 
@@ -25,3 +26,18 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "dynamodb-violation-detector"
+bench = false
+
+[[bench]]
+name = "rules"
+harness = false
+
+[[bench]]
+name = "export"
+harness = false

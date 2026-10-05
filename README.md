@@ -193,3 +193,15 @@ Unit tests run against a mock client. The integration tests in
 `tests/dynamodb_local.rs` start DynamoDB Local in Docker for each test via
 `testcontainers`, so they need a running Docker daemon. To run only the unit
 tests, use `cargo test --lib --bins`.
+
+## Benchmarks
+
+```sh
+cargo bench
+```
+
+[Criterion](https://github.com/bheisler/criterion.rs) benchmarks cover the rule
+engine (`benches/rules.rs`) and the export writers (`benches/export.rs`), each
+over batches of 1,000 items. Criterion flags pass through after `--`: `--quick`
+for a fast run, or `--save-baseline <name>` and `--baseline <name>` to compare
+against an earlier run. Reports are written to `target/criterion/`.
