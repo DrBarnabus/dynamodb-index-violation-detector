@@ -121,3 +121,14 @@ AWS_ENDPOINT_URL=http://localhost:8000 \
 AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x \
   dynamodb-violation-detector --table users --region eu-west-1
 ```
+
+## Tests
+
+```sh
+cargo test
+```
+
+Unit tests run against a mock client. The integration tests in
+`tests/dynamodb_local.rs` start DynamoDB Local in Docker for each test via
+`testcontainers`, so they need a running Docker daemon. To run only the unit
+tests, use `cargo test --lib --bins`.

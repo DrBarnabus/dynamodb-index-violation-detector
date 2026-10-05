@@ -17,6 +17,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
 
 [dev-dependencies]
+testcontainers = "0.28.0"
 tokio = { version = "1.52.3", features = ["test-util"] }
 
 [profile.release]
