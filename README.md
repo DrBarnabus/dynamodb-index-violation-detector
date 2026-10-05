@@ -71,8 +71,8 @@ Editing the region on the setup screen reconnects once you leave the field,
 refreshing the table list and re-describing the chosen table in that region.
 
 Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable`,
-and `dynamodb:ListTables` for the table picker. Without `ListTables`, type the
-table name in full.
+`dynamodb:ListTables` for the table picker and `dynamodb:GetItem` for the
+violation detail view. Without `ListTables`, type the table name in full.
 
 ### Keybindings
 
@@ -116,8 +116,18 @@ In-flight screen:
 
 Completed screen:
 
-- `↑`/`↓` or `j`/`k` — move through the feed of recent violations
-- `q` / `Esc` — quit
+- `↑`/`↓` or `j`/`k` — move through the feed of recent violations, or scroll
+  the item in the detail view
+- `Enter` — open the detail view: the item is re-fetched by key, showing
+  whether it has since been deleted or changed and whether the violation still
+  holds
+- `y` then `p`, `a` or `j` — copy the item's primary key (as DynamoDB JSON), the
+  violating attribute's name, or, in the detail view, the full item JSON
+- `q` / `Esc` — leave the detail view, or quit
+
+Copying uses the OSC 52 terminal escape, so it works over SSH in terminals that
+support it (iTerm2, WezTerm, kitty, Alacritty, Windows Terminal; tmux with
+`set-clipboard on`). macOS Terminal.app ignores it.
 
 ## Configuration
 

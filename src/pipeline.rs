@@ -15,6 +15,7 @@ use crate::aws::{AwsError, DynamoClient, TableDescription, TableKeySchema};
 use crate::config::ScanConfig;
 use crate::domain::{AttributeValue, Item, KeyAttribute};
 use crate::export::{ExportError, ExportWriter, open_writers};
+use crate::inspect::fingerprint;
 use crate::rules::{ItemViolations, RuleSet, Violation, check_item};
 use crate::scan::{ScanStream, ScannedItem, run_scan};
 use crate::state::{Aggregator, StateSnapshot};
@@ -134,6 +135,7 @@ impl Pipeline {
             return Ok(());
         }
 
+        let fingerprint = fingerprint(&scanned.item);
         let group = build_group(
             &self.rules.table,
             &self.table_key,
@@ -141,8 +143,12 @@ impl Pipeline {
             violations,
             self.detected_at,
         );
-        self.aggregator
-            .record_violations(&group.pk, group.sk.as_ref(), &group.violations);
+        self.aggregator.record_violations(
+            &group.pk,
+            group.sk.as_ref(),
+            fingerprint,
+            &group.violations,
+        );
 
         match &mut self.writer {
             Some(writer) => writer.write(&group),
@@ -171,6 +177,12 @@ impl Pipeline {
             Some(writer) => writer.close(),
             None => Ok(()),
         }
+    }
+
+    /// The rules the scan checks items against, for re-checking a re-fetched
+    /// item.
+    pub fn rules(&self) -> &RuleSet {
+        &self.rules
     }
 
     pub fn export_paths(&self) -> &[PathBuf] {

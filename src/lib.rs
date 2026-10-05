@@ -8,6 +8,7 @@ pub mod config;
 pub mod domain;
 pub mod estimate;
 pub mod export;
+pub mod inspect;
 pub mod pipeline;
 pub mod profiles;
 pub mod rules;

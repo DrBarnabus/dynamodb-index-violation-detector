@@ -6,6 +6,7 @@
 //! events onto them and drives transitions.
 
 mod app;
+mod clipboard;
 mod completed;
 mod error_modal;
 mod feed;
@@ -16,7 +17,8 @@ mod profile_picker;
 mod setup;
 
 pub use app::{App, Command};
-pub use completed::CompletedScreen;
+pub use clipboard::copy_to_clipboard;
+pub use completed::{CompletedScreen, YankTarget};
 pub use error_modal::ErrorModal;
 pub use inflight::InFlightScreen;
 pub use profile_picker::ProfilePicker;
@@ -123,6 +125,7 @@ pub(super) fn recent_violation(
             value: AttributeValue::S(pk.to_string()),
         },
         sk: None,
+        fingerprint: 0,
         violation: Violation {
             target,
             category,
@@ -133,6 +136,21 @@ pub(super) fn recent_violation(
             size_bytes: None,
         },
     }
+}
+
+/// `count` GSI type-mismatch entries for items keyed `id=u-0`, `id=u-1`, ….
+#[cfg(test)]
+pub(super) fn recent_violations(count: usize) -> Vec<crate::state::RecentViolation> {
+    (0..count)
+        .map(|i| {
+            recent_violation(
+                &format!("u-{i}"),
+                Target::Gsi("GSI1".to_string()),
+                ViolationCategory::TypeMismatch,
+                Some("email"),
+            )
+        })
+        .collect()
 }
 
 /// Every violation category in a stable display order, shared by the in-flight

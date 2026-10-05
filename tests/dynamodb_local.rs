@@ -26,7 +26,9 @@ use dynamodb_violation_detector::config::{
 };
 use dynamodb_violation_detector::domain::{self, Item, TypeCode};
 use dynamodb_violation_detector::estimate::{self, RateBound};
+use dynamodb_violation_detector::inspect::{self, Inspection};
 use dynamodb_violation_detector::pipeline::{Pipeline, now_epoch_secs};
+use dynamodb_violation_detector::rules::{RuleSet, Target, ViolationCategory};
 use dynamodb_violation_detector::state::StateSnapshot;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -249,9 +251,11 @@ impl DynamoClient for RecordingClient {
     }
 }
 
-/// The outcome of one scan: final aggregator state and the export file paths.
+/// The outcome of one scan: final aggregator state, the rules checked and the
+/// export file paths.
 struct ScanOutcome {
     snapshot: StateSnapshot,
+    rules: RuleSet,
     csv: PathBuf,
     ndjson: PathBuf,
 }
@@ -272,6 +276,7 @@ async fn scan(client: Arc<dyn DynamoClient>, config: ScanConfig) -> ScanOutcome 
 
     ScanOutcome {
         snapshot: pipeline.snapshot(),
+        rules: pipeline.rules().clone(),
         csv: config.export.csv_path.expect("CSV path"),
         ndjson: config.export.ndjson_path.expect("NDJSON path"),
     }
@@ -608,6 +613,90 @@ async fn exported_key_round_trips_through_get_item() {
         .await
         .unwrap();
     assert!(gone.is_none(), "a deleted item reads back as absent");
+}
+
+#[tokio::test]
+async fn drill_in_tells_unchanged_changed_fixed_and_deleted_items_apart() {
+    let local = LocalDynamo::start().await;
+    local.create_users_table("users", 1000).await;
+    let without_email = |pk: &str| {
+        let mut item = clean_item(pk);
+        item.remove("email");
+        item
+    };
+    local
+        .put_items(
+            "users",
+            ["unchanged", "edited", "fixed", "deleted"]
+                .map(without_email)
+                .into(),
+        )
+        .await;
+
+    let dir = export_dir("drill_in_tells_unchanged_changed_fixed_and_deleted_items_apart");
+    let outcome = scan(local.client(), all_rules_config("users", &dir)).await;
+
+    let mut edited = without_email("edited");
+    edited.insert("score".to_string(), n(11));
+    let mut fixed = without_email("fixed");
+    fixed.insert("email".to_string(), s("fixed@example.com"));
+    local.put_items("users", vec![edited, fixed]).await;
+    local
+        .sdk
+        .delete_item()
+        .table_name("users")
+        .key("pk", s("deleted"))
+        .key("sk", s("profile"))
+        .send()
+        .await
+        .unwrap();
+
+    let mut inspections = BTreeMap::new();
+    for recent in &outcome.snapshot.recent_violations {
+        assert_eq!(recent.violation.target, Target::Gsi("byEmail".to_string()));
+        assert_eq!(recent.violation.category, ViolationCategory::MissingKey);
+        let current = local
+            .client()
+            .get_item(GetItemRequest {
+                table: "users".to_string(),
+                key: inspect::primary_key(&recent.pk, recent.sk.as_ref()),
+            })
+            .await
+            .unwrap();
+        let summary = match inspect::inspect(recent, current, &outcome.rules, now_epoch_secs()) {
+            Inspection::Gone => "gone",
+            Inspection::Present {
+                changed: false,
+                still_violating: true,
+                ..
+            } => "unchanged, violating",
+            Inspection::Present {
+                changed: true,
+                still_violating: true,
+                ..
+            } => "changed, violating",
+            Inspection::Present {
+                changed: true,
+                still_violating: false,
+                ..
+            } => "changed, fixed",
+            other => panic!("unexpected inspection {other:?}"),
+        };
+        let domain::AttributeValue::S(pk) = &recent.pk.value else {
+            panic!("string partition key expected");
+        };
+        inspections.insert(pk.clone(), summary);
+    }
+
+    assert_eq!(
+        inspections,
+        BTreeMap::from([
+            ("deleted".to_string(), "gone"),
+            ("edited".to_string(), "changed, violating"),
+            ("fixed".to_string(), "changed, fixed"),
+            ("unchanged".to_string(), "unchanged, violating"),
+        ])
+    );
 }
 
 /// Items padded to ~4KB, so a 1MB scan page holds ~250 of them.

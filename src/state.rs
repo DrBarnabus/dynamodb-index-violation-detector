@@ -61,6 +61,8 @@ pub struct Aggregator {
 pub struct RecentViolation {
     pub pk: KeyAttribute,
     pub sk: Option<KeyAttribute>,
+    /// The scanned item's [`crate::inspect::fingerprint`].
+    pub fingerprint: u64,
     pub violation: Violation,
 }
 
@@ -137,13 +139,14 @@ impl Aggregator {
         }
     }
 
-    /// Record the violations of the item keyed by `pk`/`sk`: bump their category
-    /// tallies and push them onto the rolling window, evicting the oldest once
-    /// the window is full.
+    /// Record the violations of the item keyed by `pk`/`sk` with `fingerprint`:
+    /// bump their category tallies and push them onto the rolling window,
+    /// evicting the oldest once the window is full.
     pub fn record_violations(
         &self,
         pk: &KeyAttribute,
         sk: Option<&KeyAttribute>,
+        fingerprint: u64,
         violations: &[Violation],
     ) {
         self.total_violations
@@ -154,6 +157,7 @@ impl Aggregator {
             log.window.push_back(RecentViolation {
                 pk: pk.clone(),
                 sk: sk.cloned(),
+                fingerprint,
                 violation: violation.clone(),
             });
         }
@@ -301,7 +305,7 @@ mod tests {
             name: "id".to_string(),
             value: AttributeValue::S("u-1".to_string()),
         };
-        agg.record_violations(&pk, None, &[violation(category)]);
+        agg.record_violations(&pk, None, 0, &[violation(category)]);
     }
 
     #[test]
@@ -384,6 +388,7 @@ mod tests {
         agg.record_violations(
             &pk,
             Some(&sk),
+            7,
             &[
                 violation(ViolationCategory::TtlMissing),
                 violation(ViolationCategory::TtlMalformed),
@@ -398,6 +403,7 @@ mod tests {
             .map(|recent| {
                 assert_eq!(recent.pk, pk);
                 assert_eq!(recent.sk.as_ref(), Some(&sk));
+                assert_eq!(recent.fingerprint, 7);
                 recent.violation.category
             })
             .collect();

@@ -4,6 +4,7 @@
 //! describes the chosen one. *Estimate cost* re-describes the table to size the
 //! scan. On *Start scan* it starts a scan `Pipeline` and
 //! feeds its items through it, interleaved with terminal input and redraws.
+//! Once the scan completes, drilling into a violation re-fetches its item.
 //!
 //! No business logic lives here: every decision is delegated to an owning
 //! module. The shell only sequences them and moves data between them.
@@ -20,14 +21,18 @@ use std::time::Duration;
 
 use clap::Parser;
 use dynamodb_violation_detector::aws::{
-    AwsError, DynamoClient, RealDynamoClient, TableDescription,
+    AwsError, DynamoClient, GetItemRequest, RealDynamoClient, TableDescription,
 };
 use dynamodb_violation_detector::config::{self, CliArgs, ConfigError, ScanConfig};
 use dynamodb_violation_detector::estimate;
+use dynamodb_violation_detector::inspect::{self, Inspection};
 use dynamodb_violation_detector::pipeline::{Pipeline, now_epoch_secs};
 use dynamodb_violation_detector::profiles::{self, Profile, ProfileError};
 use dynamodb_violation_detector::scan::ScannedItem;
-use dynamodb_violation_detector::tui::{App, Command, ErrorModal, ProfilePicker, SetupScreen};
+use dynamodb_violation_detector::state::RecentViolation;
+use dynamodb_violation_detector::tui::{
+    App, Command, ErrorModal, ProfilePicker, SetupScreen, copy_to_clipboard,
+};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 use tokio::sync::mpsc;
@@ -199,6 +204,18 @@ impl Shell {
                     pipeline.cancel();
                 }
             }
+            Command::DrillInto(recent) => match self.drill_into(&recent, scan.as_ref()).await {
+                Ok(inspection) => app.show_inspection(inspection),
+                Err(err) => *modal = Some(err),
+            },
+            Command::CopyToClipboard(text) => {
+                if let Err(err) = copy_to_clipboard(&text) {
+                    *modal = Some(ErrorModal::message(
+                        "Could not copy to the clipboard",
+                        &format!("writing to the terminal failed: {err}"),
+                    ));
+                }
+            }
             Command::Quit => *should_quit = true,
         }
     }
@@ -347,6 +364,29 @@ impl Shell {
         Ok(pipeline)
     }
 
+    /// Re-fetch a violation's item by key and compare it with what the scan saw.
+    async fn drill_into(
+        &self,
+        recent: &RecentViolation,
+        scan: Option<&Pipeline>,
+    ) -> Result<Inspection, ErrorModal> {
+        let pipeline = scan.ok_or_else(|| {
+            ErrorModal::message("Cannot inspect violation", "no scan has been run")
+        })?;
+        let rules = pipeline.rules();
+        let request = GetItemRequest {
+            table: rules.table.clone(),
+            key: inspect::primary_key(&recent.pk, recent.sk.as_ref()),
+        };
+        let current = self
+            .client()?
+            .get_item(request)
+            .await
+            .map_err(ErrorModal::from)?;
+
+        Ok(inspect::inspect(recent, current, rules, now_epoch_secs()))
+    }
+
     /// Persist the setup form to the resolved config path.
     fn save_config(&self, app: &App) -> Result<(), ErrorModal> {
         let setup = app.setup().ok_or_else(|| {
@@ -386,7 +426,7 @@ impl Shell {
             modal.get_or_insert_with(|| ErrorModal::from(err));
         }
 
-        app.complete(pipeline.snapshot().recent_violations.len());
+        app.complete(pipeline.snapshot().recent_violations);
     }
 
     /// Render one frame: the current screen, the live snapshot while a scan is

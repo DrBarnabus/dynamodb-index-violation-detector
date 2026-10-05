@@ -2,8 +2,8 @@
 //!
 //! [`App`] owns the current screen and maps key events onto it, returning a
 //! [`Command`] for shell-level actions (choose a profile or table, estimate
-//! cost, start/cancel a scan, save config, quit) while handling navigation, toggles, and editing
-//! internally. The flow is linear — Profile picker → Setup → In-flight →
+//! cost, start/cancel a scan, save config, fetch or copy a violation, quit)
+//! while handling navigation, toggles, and editing internally. The flow is linear — Profile picker → Setup → In-flight →
 //! Completed — with no back-navigation from the completed screen; the shell
 //! drives the forward transitions.
 
@@ -15,13 +15,15 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::completed::YankTarget;
 use super::{CompletedScreen, InFlightScreen, ProfilePicker, SetupScreen, centered};
+use crate::inspect::Inspection;
 use crate::profiles::Profile;
-use crate::state::StateSnapshot;
+use crate::state::{RecentViolation, StateSnapshot};
 
 /// A shell-level action requested by the user. Navigation, toggles,
 /// and text editing are handled inside [`App`] and never surface as commands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     SelectProfile(Profile),
     SelectTable(String),
@@ -31,6 +33,9 @@ pub enum Command {
     StartScan,
     CancelScan,
     SaveConfig,
+    /// Re-fetch a violation's item for the detail view.
+    DrillInto(Box<RecentViolation>),
+    CopyToClipboard(String),
     Quit,
 }
 
@@ -78,9 +83,16 @@ impl App {
     }
 
     /// Transition to the completed screen for a finished (or cancelled) scan,
-    /// browsing `violation_count` retained violations.
-    pub fn complete(&mut self, violation_count: usize) {
-        self.screen = Screen::Completed(CompletedScreen::new(violation_count));
+    /// browsing its retained `violations`.
+    pub fn complete(&mut self, violations: Vec<RecentViolation>) {
+        self.screen = Screen::Completed(CompletedScreen::new(violations));
+    }
+
+    /// Open the completed screen's detail view on a re-fetched item.
+    pub fn show_inspection(&mut self, inspection: Inspection) {
+        if let Screen::Completed(completed) = &mut self.screen {
+            completed.show_detail(inspection);
+        }
     }
 
     /// The setup screen, if that is the current screen — the shell reads it to
@@ -242,10 +254,32 @@ fn handle_inflight(inflight: &mut InFlightScreen, key: KeyEvent) -> Option<Comma
 }
 
 fn handle_completed(completed: &mut CompletedScreen, key: KeyEvent) -> Option<Command> {
+    completed.clear_notice();
+    if completed.is_yank_pending() {
+        let target = match key.code {
+            KeyCode::Char('p') => YankTarget::PrimaryKey,
+            KeyCode::Char('a') => YankTarget::Attribute,
+            KeyCode::Char('j') => YankTarget::ItemJson,
+            _ => {
+                completed.cancel_yank();
+                return None;
+            }
+        };
+
+        return completed.yank(target).map(Command::CopyToClipboard);
+    }
+
     match key.code {
+        KeyCode::Char('q') | KeyCode::Esc if completed.is_detail_open() => completed.close_detail(),
         KeyCode::Char('q') | KeyCode::Esc => return Some(Command::Quit),
         KeyCode::Down | KeyCode::Char('j') => completed.select_next(),
         KeyCode::Up | KeyCode::Char('k') => completed.select_prev(),
+        KeyCode::Enter if !completed.is_detail_open() => {
+            return completed
+                .selected_violation()
+                .map(|recent| Command::DrillInto(Box::new(recent.clone())));
+        }
+        KeyCode::Char('y') => completed.begin_yank(),
         _ => {}
     }
 
@@ -268,13 +302,15 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
     let lines = vec![
         bind("↑/↓", "move, or through a picker list"),
         bind("j/k", "move (completed screen)"),
+        bind("Enter", "inspect violation (completed)"),
+        bind("y", "copy key / attribute / item JSON"),
         bind("Tab", "next field / swap scan view"),
         bind("Space", "toggle"),
         bind("Enter", "choose / add GSI / estimate / start"),
         bind("Del", "remove hypothetical GSI"),
         bind("Ctrl+S", "save config"),
         bind("Ctrl+C", "cancel scan"),
-        bind("q / Esc", "quit or cancel scan"),
+        bind("q / Esc", "quit, back or cancel scan"),
         bind("?", "close this help"),
     ];
 
@@ -289,6 +325,7 @@ mod tests {
     use crate::aws::{TableDescription, TableKeySchema};
     use crate::config::{ExportConfig, ScanConfig};
     use crate::domain::{KeySchemaElement, TypeCode};
+    use crate::tui::recent_violations;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::time::Duration;
@@ -640,7 +677,7 @@ mod tests {
     #[test]
     fn completed_navigates_and_quits() {
         let mut app = app();
-        app.complete(3);
+        app.complete(recent_violations(3));
 
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Down));
@@ -660,8 +697,53 @@ mod tests {
         app.begin_scan();
         assert!(render_text(&app, Some(&snapshot())).contains("Scan in progress"));
 
-        app.complete(0);
+        app.complete(Vec::new());
         assert!(render_text(&app, Some(&snapshot())).contains("Scan complete"));
+    }
+
+    #[test]
+    fn completed_enter_drills_into_the_selection_and_esc_returns() {
+        let mut app = app();
+        let recent = recent_violations(2);
+        app.complete(recent.clone());
+        app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::DrillInto(Box::new(recent[1].clone())))
+        );
+
+        app.show_inspection(Inspection::Gone);
+        assert!(render_text(&app, Some(&snapshot())).contains("Item deleted"));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert!(!render_text(&app, Some(&snapshot())).contains("Item deleted"));
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(Command::Quit));
+    }
+
+    #[test]
+    fn completed_enter_without_violations_does_nothing() {
+        let mut app = app();
+        app.complete(Vec::new());
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn completed_y_then_a_target_copies_and_other_keys_cancel() {
+        let mut app = app();
+        app.complete(recent_violations(1));
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('a'))),
+            Some(Command::CopyToClipboard("email".to_string()))
+        );
+
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('a'))), None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Some(Command::Quit));
     }
 
     #[test]

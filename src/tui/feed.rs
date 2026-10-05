@@ -64,13 +64,11 @@ pub(super) fn render_feed(
 
 fn feed_line(recent: &RecentViolation) -> Line<'static> {
     let violation = &recent.violation;
-    let mut key = key_text(&recent.pk);
-    if let Some(sk) = &recent.sk {
-        key.push_str(&format!(" {}", key_text(sk)));
-    }
-
     let mut spans = vec![
-        Span::styled(key, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            item_key_text(recent),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(
             target_label(&violation.target),
@@ -84,6 +82,16 @@ fn feed_line(recent: &RecentViolation) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+/// The violating item's key as `pk=value sk=value`.
+pub(super) fn item_key_text(recent: &RecentViolation) -> String {
+    let mut key = key_text(&recent.pk);
+    if let Some(sk) = &recent.sk {
+        key.push_str(&format!(" {}", key_text(sk)));
+    }
+
+    key
 }
 
 /// `name=value` for a key attribute, rendered as in the CSV export.

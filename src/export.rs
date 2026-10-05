@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 
 use crate::config::ExportConfig;
-use crate::domain::{AttributeValue, KeyAttribute, TypeCode};
+use crate::domain::{AttributeValue, Item, KeyAttribute, TypeCode};
 use crate::rules::{ItemViolations, Target, Violation, ViolationCategory};
 
 /// A failure while serialising or flushing export output.
@@ -280,6 +280,15 @@ fn key_object(key: &KeyAttribute) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// An item in native DynamoDB JSON shape, as `GetItem` and the AWS CLI accept
+/// it, with binary encoded as base64 strings.
+pub fn item_json(item: &Item) -> serde_json::Value {
+    item.iter()
+        .map(|(name, value)| (name.clone(), native_value(value)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 /// Render an attribute value in native DynamoDB JSON shape, recursively, with
 /// binary encoded as base64 strings.
 fn native_value(value: &AttributeValue) -> serde_json::Value {
@@ -340,7 +349,7 @@ fn category_label(category: ViolationCategory) -> &'static str {
     }
 }
 
-fn expected_type_code(violation: &Violation) -> Option<&'static str> {
+pub(crate) fn expected_type_code(violation: &Violation) -> Option<&'static str> {
     match violation.expected_type {
         Some(TypeCode::S) => Some("S"),
         Some(TypeCode::N) => Some("N"),
@@ -697,6 +706,24 @@ mod tests {
         );
 
         assert!(to_ndjson(&[g]).contains(r#""pk":{"pk":{"B":"AQIDBA=="}}"#));
+    }
+
+    #[test]
+    fn item_json_renders_every_attribute_in_native_shape() {
+        let item: Item = [
+            ("id".to_string(), AttributeValue::S("u-1".to_string())),
+            ("blob".to_string(), AttributeValue::B(vec![1, 2, 3])),
+            (
+                "tags".to_string(),
+                AttributeValue::L(vec![AttributeValue::N("7".to_string())]),
+            ),
+        ]
+        .into();
+
+        assert_eq!(
+            item_json(&item).to_string(),
+            r#"{"blob":{"B":"AQID"},"id":{"S":"u-1"},"tags":{"L":[{"N":"7"}]}}"#
+        );
     }
 
     #[test]
