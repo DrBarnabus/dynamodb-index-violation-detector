@@ -232,6 +232,7 @@ fn handle_inflight(inflight: &mut InFlightScreen, key: KeyEvent) -> Option<Comma
     }
 
     match key.code {
+        KeyCode::Tab => inflight.toggle_body(),
         KeyCode::Char('c') if ctrl => inflight.request_cancel(),
         KeyCode::Char('q') | KeyCode::Esc => inflight.request_cancel(),
         _ => {}
@@ -267,7 +268,7 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
     let lines = vec![
         bind("↑/↓", "move, or through a picker list"),
         bind("j/k", "move (completed screen)"),
-        bind("Tab", "next field"),
+        bind("Tab", "next field / swap scan view"),
         bind("Space", "toggle"),
         bind("Enter", "choose / add GSI / estimate / start"),
         bind("Del", "remove hypothetical GSI"),
@@ -612,6 +613,15 @@ mod tests {
             app.handle_key(key(KeyCode::Char('y'))),
             Some(Command::CancelScan)
         );
+    }
+
+    #[test]
+    fn inflight_tab_swaps_to_the_live_feed() {
+        let mut app = app();
+        app.begin_scan();
+
+        assert_eq!(app.handle_key(key(KeyCode::Tab)), None);
+        assert!(render_text(&app, Some(&snapshot())).contains("Live violations"));
     }
 
     #[test]

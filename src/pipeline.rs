@@ -134,14 +134,6 @@ impl Pipeline {
             return Ok(());
         }
 
-        for violation in &violations {
-            self.aggregator.record_violation(violation);
-        }
-
-        let Some(writer) = &mut self.writer else {
-            return Ok(());
-        };
-
         let group = build_group(
             &self.rules.table,
             &self.table_key,
@@ -149,7 +141,15 @@ impl Pipeline {
             violations,
             self.detected_at,
         );
-        writer.write(&group)
+        for violation in &group.violations {
+            self.aggregator
+                .record_violation(&group.pk, group.sk.as_ref(), violation);
+        }
+
+        match &mut self.writer {
+            Some(writer) => writer.write(&group),
+            None => Ok(()),
+        }
     }
 
     /// Stop issuing scans; items already fetched still drain through `next`.
@@ -407,6 +407,13 @@ mod tests {
                 .category_counts
                 .get(&ViolationCategory::TtlWrongType),
             Some(&1)
+        );
+        assert!(
+            snapshot
+                .recent_violations
+                .iter()
+                .all(|recent| recent.pk.value == s("u2") && recent.sk.is_none()),
+            "the feed keys each violation to its item"
         );
 
         let csv = csv.contents();

@@ -109,11 +109,14 @@ segments or rate limit clears the estimate.
 
 In-flight screen:
 
+- `Tab` — swap the body between detailed progress (per-category counts and
+  per-segment bars) and the live feed of the last 1000 violations, each shown
+  with its item's key
 - `Ctrl+C`, `q` or `Esc` — cancel the scan; confirm with `y`, dismiss with `n` / `Esc`
 
 Completed screen:
 
-- `↑`/`↓` or `j`/`k` — move through the violation summary
+- `↑`/`↓` or `j`/`k` — move through the feed of recent violations
 - `q` / `Esc` — quit
 
 ## Configuration

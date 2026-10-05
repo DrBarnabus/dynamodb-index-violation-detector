@@ -8,6 +8,7 @@
 mod app;
 mod completed;
 mod error_modal;
+mod feed;
 mod gsi_form;
 mod inflight;
 mod picker;

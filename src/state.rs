@@ -8,8 +8,8 @@
 //! rolling window, per-category tallies and rate history take a short lock.
 //!
 //! Memory is bounded regardless of violation count: the feed retains a
-//! fixed rolling window of the last [`ROLLING_WINDOW_CAP`] violations and tallies
-//! are O(categories).
+//! fixed rolling window of the last [`ROLLING_WINDOW_CAP`] violations, each
+//! with its item's key, and tallies are O(categories).
 //!
 //! Rates are trailing-window, sampled lazily inside `snapshot` from the cumulative
 //! counters, so the hot record paths stay lock-light. The [`Clock`] is injectable
@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::domain::KeyAttribute;
 use crate::rules::{Violation, ViolationCategory};
 
 /// Fixed cap on the in-memory violation feed.
@@ -55,10 +56,18 @@ pub struct Aggregator {
     rate: Mutex<RateHistory>,
 }
 
+/// A violation in the rolling window, keyed by the item that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentViolation {
+    pub pk: KeyAttribute,
+    pub sk: Option<KeyAttribute>,
+    pub violation: Violation,
+}
+
 /// Per-category tallies plus the bounded rolling window of recent violations.
 struct ViolationLog {
     counts: HashMap<ViolationCategory, u64>,
-    window: VecDeque<Violation>,
+    window: VecDeque<RecentViolation>,
 }
 
 /// Trailing samples of the cumulative counters, used to derive rates.
@@ -86,7 +95,8 @@ pub struct StateSnapshot {
     pub eta: Option<Duration>,
     pub item_count: u64,
     pub progress: f64,
-    pub recent_violations: Vec<Violation>,
+    /// Oldest first.
+    pub recent_violations: Vec<RecentViolation>,
 }
 
 impl Aggregator {
@@ -127,13 +137,23 @@ impl Aggregator {
         }
     }
 
-    /// Record one detected violation: bump its category tally and push it onto the
-    /// rolling window, evicting the oldest once the window is full.
-    pub fn record_violation(&self, violation: &Violation) {
+    /// Record one violation of the item keyed by `pk`/`sk`: bump its category
+    /// tally and push it onto the rolling window, evicting the oldest once the
+    /// window is full.
+    pub fn record_violation(
+        &self,
+        pk: &KeyAttribute,
+        sk: Option<&KeyAttribute>,
+        violation: &Violation,
+    ) {
         self.total_violations.fetch_add(1, Ordering::Relaxed);
         let mut log = self.log.lock().expect("violation log not poisoned");
         *log.counts.entry(violation.category).or_insert(0) += 1;
-        log.window.push_back(violation.clone());
+        log.window.push_back(RecentViolation {
+            pk: pk.clone(),
+            sk: sk.cloned(),
+            violation: violation.clone(),
+        });
         if log.window.len() > ROLLING_WINDOW_CAP {
             log.window.pop_front();
         }
@@ -233,6 +253,7 @@ impl RateHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::AttributeValue;
     use crate::rules::{Target, ViolationCategory};
 
     /// A clock that starts at construction time and only advances when told to.
@@ -273,6 +294,14 @@ mod tests {
         }
     }
 
+    fn record(agg: &Aggregator, category: ViolationCategory) {
+        let pk = KeyAttribute {
+            name: "id".to_string(),
+            value: AttributeValue::S("u-1".to_string()),
+        };
+        agg.record_violation(&pk, None, &violation(category));
+    }
+
     #[test]
     fn records_per_segment_and_aggregate_items() {
         let agg = Aggregator::new(3, 0, MockClock::new());
@@ -299,9 +328,9 @@ mod tests {
     #[test]
     fn tallies_categories_and_total_violations() {
         let agg = Aggregator::new(1, 0, MockClock::new());
-        agg.record_violation(&violation(ViolationCategory::TypeMismatch));
-        agg.record_violation(&violation(ViolationCategory::TypeMismatch));
-        agg.record_violation(&violation(ViolationCategory::MissingKey));
+        record(&agg, ViolationCategory::TypeMismatch);
+        record(&agg, ViolationCategory::TypeMismatch);
+        record(&agg, ViolationCategory::MissingKey);
 
         let snap = agg.snapshot();
         assert_eq!(snap.total_violations, 3);
@@ -313,7 +342,7 @@ mod tests {
     fn rolling_window_is_bounded_but_total_is_not() {
         let agg = Aggregator::new(1, 0, MockClock::new());
         for _ in 0..(ROLLING_WINDOW_CAP + 5) {
-            agg.record_violation(&violation(ViolationCategory::SizeExceeded));
+            record(&agg, ViolationCategory::SizeExceeded);
         }
 
         let snap = agg.snapshot();
@@ -324,9 +353,9 @@ mod tests {
     #[test]
     fn rolling_window_keeps_the_most_recent_and_evicts_the_oldest() {
         let agg = Aggregator::new(1, 0, MockClock::new());
-        agg.record_violation(&violation(ViolationCategory::TtlMissing));
+        record(&agg, ViolationCategory::TtlMissing);
         for _ in 0..ROLLING_WINDOW_CAP {
-            agg.record_violation(&violation(ViolationCategory::TtlMalformed));
+            record(&agg, ViolationCategory::TtlMalformed);
         }
 
         let snap = agg.snapshot();
@@ -334,9 +363,28 @@ mod tests {
         assert!(
             snap.recent_violations
                 .iter()
-                .all(|v| v.category == ViolationCategory::TtlMalformed),
+                .all(|v| v.violation.category == ViolationCategory::TtlMalformed),
             "the single oldest TtlMissing should have been evicted"
         );
+    }
+
+    #[test]
+    fn rolling_window_carries_the_item_key() {
+        let agg = Aggregator::new(1, 0, MockClock::new());
+        let pk = KeyAttribute {
+            name: "id".to_string(),
+            value: AttributeValue::S("u-7".to_string()),
+        };
+        let sk = KeyAttribute {
+            name: "ts".to_string(),
+            value: AttributeValue::N("42".to_string()),
+        };
+        agg.record_violation(&pk, Some(&sk), &violation(ViolationCategory::TtlMissing));
+
+        let recent = &agg.snapshot().recent_violations[0];
+        assert_eq!(recent.pk, pk);
+        assert_eq!(recent.sk, Some(sk));
+        assert_eq!(recent.violation.category, ViolationCategory::TtlMissing);
     }
 
     #[test]

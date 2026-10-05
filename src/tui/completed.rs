@@ -1,10 +1,10 @@
 //! Completed scan screen.
 //!
 //! A static, browsable summary of a finished scan: final per-category counts,
-//! the paths of the export files, and a scrollable list of the last 1000
-//! violations (the aggregator's rolling window). Navigation moves a selection
-//! cursor over the list; the GetItem drill-in detail view and clipboard yank are
-//! deferred.
+//! the paths of the export files, and the violation feed of the last 1000
+//! violations (the aggregator's rolling window), now static. Navigation moves a
+//! selection cursor over the feed; the GetItem drill-in detail view and
+//! clipboard yank are deferred.
 
 use std::path::PathBuf;
 
@@ -12,10 +12,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::{ALL_CATEGORIES, category_label, focus_style, target_label};
-use crate::rules::Violation;
+use super::feed::{FeedView, render_feed};
+use super::{ALL_CATEGORIES, category_label};
 use crate::state::StateSnapshot;
 
 /// The completed scan screen. Owns the browse cursor; all data is read from the
@@ -122,46 +122,15 @@ impl CompletedScreen {
             " Recent violations ({}) ",
             snapshot.recent_violations.len()
         ));
-
-        if snapshot.recent_violations.is_empty() {
-            let empty = Paragraph::new("No violations found.")
-                .style(Style::default().fg(Color::Green))
-                .block(block);
-            frame.render_widget(empty, area);
-            return;
-        }
-
-        let items: Vec<ListItem> = snapshot
-            .recent_violations
-            .iter()
-            .map(|v| ListItem::new(violation_line(v)))
-            .collect();
-
-        let list = List::new(items)
-            .block(block)
-            .highlight_symbol("▶ ")
-            .highlight_style(focus_style(true));
-
-        let mut state = ListState::default();
-        state.select(Some(
-            self.selected.min(snapshot.recent_violations.len() - 1),
-        ));
-        frame.render_stateful_widget(list, area, &mut state);
+        render_feed(
+            frame,
+            area,
+            block,
+            &snapshot.recent_violations,
+            FeedView::Cursor(self.selected),
+            "No violations found.",
+        );
     }
-}
-
-fn violation_line(v: &Violation) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(target_label(&v.target), Style::default().fg(Color::Yellow)),
-        Span::raw(" · "),
-        Span::raw(category_label(v.category)),
-    ];
-
-    if let Some(attribute) = &v.attribute {
-        spans.push(Span::raw(format!("  attr `{attribute}`")));
-    }
-
-    Line::from(spans)
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -176,7 +145,9 @@ fn section(title: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Target, ViolationCategory};
+    use crate::domain::{AttributeValue, KeyAttribute};
+    use crate::rules::{Target, Violation, ViolationCategory};
+    use crate::state::RecentViolation;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -186,22 +157,29 @@ mod tests {
         target: Target,
         category: ViolationCategory,
         attribute: Option<&str>,
-    ) -> Violation {
-        Violation {
-            target,
-            category,
-            attribute: attribute.map(str::to_string),
-            actual_value: None,
-            actual_type: None,
-            expected_type: None,
-            size_bytes: None,
+    ) -> RecentViolation {
+        RecentViolation {
+            pk: KeyAttribute {
+                name: "id".to_string(),
+                value: AttributeValue::S("u-1".to_string()),
+            },
+            sk: None,
+            violation: Violation {
+                target,
+                category,
+                attribute: attribute.map(str::to_string),
+                actual_value: None,
+                actual_type: None,
+                expected_type: None,
+                size_bytes: None,
+            },
         }
     }
 
-    fn snapshot(violations: Vec<Violation>) -> StateSnapshot {
+    fn snapshot(violations: Vec<RecentViolation>) -> StateSnapshot {
         let mut category_counts = HashMap::new();
         for v in &violations {
-            *category_counts.entry(v.category).or_insert(0) += 1;
+            *category_counts.entry(v.violation.category).or_insert(0) += 1;
         }
 
         StateSnapshot {
@@ -268,7 +246,7 @@ mod tests {
         let text = draw(&screen, &snap, &[], 80, 40);
 
         assert!(text.contains("Recent violations (1)"));
-        assert!(text.contains("GSI GSI1"));
+        assert!(text.contains("id=u-1  GSI GSI1"));
         assert!(text.contains("attr `email`"));
     }
 

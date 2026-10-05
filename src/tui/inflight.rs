@@ -1,10 +1,10 @@
 //! In-flight scan screen.
 //!
 //! Renders live scan progress from a [`StateSnapshot`]: a fixed header of
-//! aggregate stats over a detailed body of per-segment progress bars and
-//! per-category violation counts. `Ctrl+C` raises a cancel-confirmation modal
-//! the screen owns; the event loop turns a confirmed cancel into a
-//! `CancelScan` command. The live-violations feed swap-view is deferred.
+//! aggregate stats over a body that `Tab` swaps between detailed progress
+//! (per-category violation counts and per-segment progress bars) and the live
+//! violations feed. `Ctrl+C` raises a cancel-confirmation modal the screen
+//! owns; the event loop turns a confirmed cancel into a `CancelScan` command.
 
 use std::time::Duration;
 
@@ -14,22 +14,40 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::feed::{FeedView, render_feed};
 use super::{ALL_CATEGORIES, category_label, centered, fmt_duration};
 use crate::state::StateSnapshot;
 
 /// Width of the inline per-segment progress bars, in cells.
 const BAR_WIDTH: usize = 24;
 
+/// Which view fills the body beneath the stats header.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    #[default]
+    Progress,
+    Feed,
+}
+
 /// The in-flight scan screen. Holds only transient UI state; all progress data
 /// is read from the [`StateSnapshot`] passed to [`render`](InFlightScreen::render).
 #[derive(Debug, Default)]
 pub struct InFlightScreen {
     confirming_cancel: bool,
+    body: Body,
 }
 
 impl InFlightScreen {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Swap the body between detailed progress and the live violations feed.
+    pub fn toggle_body(&mut self) {
+        self.body = match self.body {
+            Body::Progress => Body::Feed,
+            Body::Feed => Body::Progress,
+        };
     }
 
     /// Raise the cancel-confirmation modal (`Ctrl+C`).
@@ -54,7 +72,10 @@ impl InFlightScreen {
             Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
 
         self.render_header(snapshot, frame, header_area);
-        self.render_body(snapshot, frame, body_area);
+        match self.body {
+            Body::Progress => self.render_progress(snapshot, frame, body_area),
+            Body::Feed => render_live_feed(snapshot, frame, body_area),
+        }
 
         if self.confirming_cancel {
             render_cancel_modal(frame, area);
@@ -108,8 +129,10 @@ impl InFlightScreen {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn render_body(&self, snapshot: &StateSnapshot, frame: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(" Progress ");
+    fn render_progress(&self, snapshot: &StateSnapshot, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Progress · Tab: live violations ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -143,6 +166,21 @@ impl InFlightScreen {
 
         frame.render_widget(Paragraph::new(lines), inner);
     }
+}
+
+fn render_live_feed(snapshot: &StateSnapshot, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Live violations (last {}) · Tab: progress ",
+        snapshot.recent_violations.len()
+    ));
+    render_feed(
+        frame,
+        area,
+        block,
+        &snapshot.recent_violations,
+        FeedView::Tail,
+        "No violations yet.",
+    );
 }
 
 fn render_cancel_modal(frame: &mut Frame, area: Rect) {
@@ -211,7 +249,9 @@ fn fmt_eta(eta: Option<Duration>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::ViolationCategory;
+    use crate::domain::{AttributeValue, KeyAttribute};
+    use crate::rules::{Target, Violation, ViolationCategory};
+    use crate::state::RecentViolation;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -268,6 +308,52 @@ mod tests {
         assert!(text.contains("Segments (3)"));
         assert!(text.contains("#0"));
         assert!(text.contains("#2"));
+    }
+
+    fn recent(pk: &str) -> RecentViolation {
+        RecentViolation {
+            pk: KeyAttribute {
+                name: "id".to_string(),
+                value: AttributeValue::S(pk.to_string()),
+            },
+            sk: None,
+            violation: Violation {
+                target: Target::Ttl,
+                category: ViolationCategory::TtlMalformed,
+                attribute: Some("expiresAt".to_string()),
+                actual_value: None,
+                actual_type: None,
+                expected_type: None,
+                size_bytes: None,
+            },
+        }
+    }
+
+    #[test]
+    fn tab_swaps_the_body_to_the_live_feed_and_back() {
+        let mut snap = snapshot();
+        snap.recent_violations = (0..40).map(|i| recent(&format!("u-{i:02}"))).collect();
+        let mut screen = InFlightScreen::new();
+
+        screen.toggle_body();
+        let text = draw(&screen, &snap, 80, 24);
+        assert!(text.contains("Scan in progress"), "header stays fixed");
+        assert!(text.contains("Live violations (last 40)"));
+        assert!(text.contains("id=u-39  TTL · TTL malformed"));
+        assert!(!text.contains("Segments (3)"));
+
+        screen.toggle_body();
+        let text = draw(&screen, &snap, 80, 24);
+        assert!(text.contains("Segments (3)"));
+        assert!(!text.contains("Live violations"));
+    }
+
+    #[test]
+    fn empty_live_feed_says_so() {
+        let mut screen = InFlightScreen::new();
+        screen.toggle_body();
+
+        assert!(draw(&screen, &snapshot(), 80, 24).contains("No violations yet."));
     }
 
     #[test]
