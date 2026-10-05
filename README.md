@@ -39,10 +39,17 @@ cargo build --release --target x86_64-unknown-linux-musl
 dynamodb-violation-detector [OPTIONS]
 ```
 
-A table is required, from either `--table` or `table` in the config file. The
-tool describes the table before the TUI starts, so a missing table or bad
-credentials are reported on stderr. It then opens the scan setup screen,
-pre-filled from the config file and flags.
+With no config file, no `AWS_PROFILE` and no flags, the tool opens on a profile
+picker listing the profiles in `~/.aws/config` and `~/.aws/credentials` (or the
+files named by `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`). The chosen
+profile's region pre-fills the setup screen. Otherwise it opens straight on the
+scan setup screen, pre-filled from the config file and flags.
+
+On the setup screen, the table field filters the account's tables as you type;
+choosing one describes it and lists its indexes and TTL attribute. A table name
+from `--table` or the config file is described on launch. AWS errors (expired
+credentials, missing permissions, an unknown table) are shown in a modal with a
+suggested fix.
 
 | Flag | Description |
 | --- | --- |
@@ -61,15 +68,23 @@ Uses the default AWS credential provider chain (environment, shared config, SSO,
 IMDS, container). For SSO, run `aws sso login --profile <name>` before launching.
 Region defaults from the profile or environment and is overridable per scan.
 
-Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable`.
+Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable`,
+and `dynamodb:ListTables` for the table picker. Without `ListTables`, type the
+table name in full.
 
 ### Keybindings
 
 `?` toggles the help overlay on every screen.
 
+Profile picker:
+
+- Type to filter, `↑`/`↓` to move, `Enter` to choose, `Esc` to quit
+
 Setup screen:
 
 - `Tab` / `↓` and `Shift+Tab` / `↑` — move between fields
+- On the table field, type to filter; `↑`/`↓` move through matching tables and
+  `Enter` chooses the highlighted one (or the typed name when nothing matches)
 - `Space` — toggle a checkbox
 - `Enter` — next field, or start the scan on *Start scan*
 - `Ctrl+S` — save the form to the config file

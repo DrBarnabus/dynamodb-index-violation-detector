@@ -1,11 +1,11 @@
 //! Screen state machine and key dispatch.
 //!
 //! [`App`] owns the current screen and maps key events onto it, returning a
-//! [`Command`] for shell-level actions (start/cancel a scan, save config, quit)
-//! while handling navigation, toggles, and editing internally. The flow is
-//! linear — Setup → In-flight → Completed — with no back-navigation from the
-//! completed screen; the shell drives the forward
-//! transitions as the scan starts and finishes.
+//! [`Command`] for shell-level actions (choose a profile or table, start/cancel
+//! a scan, save config, quit) while handling navigation, toggles, and editing
+//! internally. The flow is linear — Profile picker → Setup → In-flight →
+//! Completed — with no back-navigation from the completed screen; the shell
+//! drives the forward transitions.
 
 use std::path::PathBuf;
 
@@ -15,13 +15,16 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::{CompletedScreen, InFlightScreen, SetupScreen, centered};
+use super::{CompletedScreen, InFlightScreen, ProfilePicker, SetupScreen, centered};
+use crate::profiles::Profile;
 use crate::state::StateSnapshot;
 
 /// A shell-level action requested by the user. Navigation, toggles,
 /// and text editing are handled inside [`App`] and never surface as commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    SelectProfile(Profile),
+    SelectTable(String),
     StartScan,
     CancelScan,
     SaveConfig,
@@ -29,6 +32,7 @@ pub enum Command {
 }
 
 enum Screen {
+    ProfilePicker(ProfilePicker),
     Setup(Box<SetupScreen>),
     InFlight(InFlightScreen),
     Completed(CompletedScreen),
@@ -41,13 +45,28 @@ pub struct App {
 }
 
 impl App {
-    /// Start on the setup screen; the launch/profile picker is
-    /// skipped when the scan is already targeted via config or CLI.
+    /// Start on the setup screen, skipping the profile picker because the
+    /// scan is already targeted via config or CLI.
     pub fn new(setup: SetupScreen) -> Self {
+        Self::with_screen(Screen::Setup(Box::new(setup)))
+    }
+
+    /// Start on the profile picker.
+    pub fn pick_profile(picker: ProfilePicker) -> Self {
+        Self::with_screen(Screen::ProfilePicker(picker))
+    }
+
+    fn with_screen(screen: Screen) -> Self {
         Self {
-            screen: Screen::Setup(Box::new(setup)),
+            screen,
             show_help: false,
         }
+    }
+
+    /// Transition Profile picker → Setup once the chosen profile's client is
+    /// ready.
+    pub fn show_setup(&mut self, setup: SetupScreen) {
+        self.screen = Screen::Setup(Box::new(setup));
     }
 
     /// Transition Setup → In-flight when a scan starts.
@@ -65,6 +84,14 @@ impl App {
     /// build a [`crate::config::ScanConfig`] on [`Command::StartScan`].
     pub fn setup(&self) -> Option<&SetupScreen> {
         match &self.screen {
+            Screen::Setup(setup) => Some(setup),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the setup screen, for loading a described table.
+    pub fn setup_mut(&mut self) -> Option<&mut SetupScreen> {
+        match &mut self.screen {
             Screen::Setup(setup) => Some(setup),
             _ => None,
         }
@@ -88,6 +115,7 @@ impl App {
         }
 
         match &mut self.screen {
+            Screen::ProfilePicker(picker) => handle_profile_picker(picker, key),
             Screen::Setup(setup) => handle_setup(setup, key),
             Screen::InFlight(inflight) => handle_inflight(inflight, key),
             Screen::Completed(completed) => handle_completed(completed, key),
@@ -105,6 +133,7 @@ impl App {
     ) {
         let area = frame.area();
         match &self.screen {
+            Screen::ProfilePicker(picker) => picker.render(frame, area),
             Screen::Setup(setup) => setup.render(frame, area),
             Screen::InFlight(inflight) => {
                 if let Some(snapshot) = snapshot {
@@ -124,16 +153,36 @@ impl App {
     }
 }
 
+fn handle_profile_picker(picker: &mut ProfilePicker, key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => return Some(Command::Quit),
+        KeyCode::Enter => return picker.selected().cloned().map(Command::SelectProfile),
+        KeyCode::Down => picker.select_next(),
+        KeyCode::Up => picker.select_prev(),
+        KeyCode::Backspace => picker.backspace(),
+        KeyCode::Char(c) => picker.input_char(c),
+        _ => {}
+    }
+
+    None
+}
+
 fn handle_setup(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => return Some(Command::Quit),
         KeyCode::Char('s') if ctrl => return Some(Command::SaveConfig),
+        KeyCode::Down if setup.is_table_list_active() => setup.table_list_next(),
+        KeyCode::Up if setup.is_table_list_active() => setup.table_list_prev(),
         KeyCode::Tab | KeyCode::Down => setup.focus_next(),
         KeyCode::BackTab | KeyCode::Up => setup.focus_prev(),
         KeyCode::Enter => {
             if setup.is_start_focused() {
                 return Some(Command::StartScan);
+            }
+
+            if setup.is_table_focused() {
+                return setup.choose_table().map(Command::SelectTable);
             }
 
             setup.focus_next();
@@ -181,7 +230,7 @@ fn handle_completed(completed: &mut CompletedScreen, key: KeyEvent) -> Option<Co
 }
 
 fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let modal = centered(area, 46, 11);
+    let modal = centered(area, 50, 12);
     frame.render_widget(Clear, modal);
 
     let block = Block::default()
@@ -197,13 +246,14 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
     };
 
     let lines = vec![
-        bind("↑/↓ · j/k", "navigate"),
+        bind("↑/↓", "move, or through a picker list"),
+        bind("j/k", "move (completed screen)"),
         bind("Tab", "next field"),
         bind("Space", "toggle"),
-        bind("Enter", "start / drill in"),
+        bind("Enter", "choose / start scan"),
         bind("Ctrl+S", "save config"),
         bind("Ctrl+C", "cancel scan"),
-        bind("q / Esc", "quit or back"),
+        bind("q / Esc", "quit or cancel scan"),
         bind("?", "close this help"),
     ];
 
@@ -266,7 +316,24 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(SetupScreen::new(&config(), &description()))
+        App::new(SetupScreen::new(
+            &config(),
+            Some(&description()),
+            Vec::new(),
+        ))
+    }
+
+    fn picker_app() -> App {
+        App::pick_profile(ProfilePicker::new(vec![
+            Profile {
+                name: "default".to_string(),
+                region: None,
+            },
+            Profile {
+                name: "prod".to_string(),
+                region: Some("eu-west-1".to_string()),
+            },
+        ]))
     }
 
     fn snapshot() -> StateSnapshot {
@@ -309,11 +376,74 @@ mod tests {
     }
 
     #[test]
-    fn setup_enter_off_button_advances_focus_without_command() {
+    fn setup_enter_on_table_field_selects_the_table() {
+        let mut app = App::new(SetupScreen::new(&config(), None, Vec::new()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::SelectTable("users".to_string()))
+        );
+        assert!(!app.setup().unwrap().is_table_focused());
+    }
+
+    #[test]
+    fn setup_enter_on_other_fields_advances_focus_without_command() {
         let mut app = app();
+        app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
-        // Focus moved off the table field, so it is no longer the text target.
         assert!(app.setup().unwrap().focus_is_text());
+    }
+
+    #[test]
+    fn setup_arrows_move_through_the_table_list_while_it_has_matches() {
+        let tables = vec!["orders".to_string(), "users".to_string()];
+        let mut app = App::new(SetupScreen::new(&config(), None, tables));
+        for _ in 0.."users".len() {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+
+        app.handle_key(key(KeyCode::Down));
+        assert!(app.setup().unwrap().is_table_focused());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::SelectTable("users".to_string()))
+        );
+
+        app.handle_key(key(KeyCode::Up));
+        assert!(app.setup().unwrap().is_table_focused());
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::Down));
+        assert!(!app.setup().unwrap().is_table_focused());
+    }
+
+    #[test]
+    fn profile_picker_filters_and_chooses() {
+        let mut app = picker_app();
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::SelectProfile(Profile {
+                name: "prod".to_string(),
+                region: Some("eu-west-1".to_string()),
+            }))
+        );
+    }
+
+    #[test]
+    fn profile_picker_enter_without_match_does_nothing_and_esc_quits() {
+        let mut app = picker_app();
+        app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(Command::Quit));
+    }
+
+    #[test]
+    fn show_setup_leaves_the_profile_picker() {
+        let mut app = picker_app();
+        assert!(app.setup().is_none());
+        assert!(render_text(&app, None).contains("Choose AWS profile"));
+
+        app.show_setup(SetupScreen::new(&config(), None, Vec::new()));
+        assert!(app.setup_mut().is_some());
     }
 
     #[test]
@@ -415,16 +545,6 @@ mod tests {
             .draw(|frame| app.render(frame, snapshot, &[]))
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let area = buffer.area;
-        let mut text = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-
-        text
+        crate::tui::buffer_text(terminal.backend().buffer())
     }
 }

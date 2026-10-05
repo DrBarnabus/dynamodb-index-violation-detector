@@ -1,12 +1,13 @@
 //! Application shell: the thin wiring that binds every module into a
-//! running program. `main` resolves configuration, builds the AWS client,
-//! discovers the table schema, then drives the TUI event loop. On *Start scan*
-//! it starts a scan `Pipeline` and feeds its items through it, interleaved with
-//! terminal input and redraws.
+//! running program. `main` resolves configuration, then drives the TUI event
+//! loop: once a profile is known it builds the AWS client, lists tables and
+//! describes the chosen one. On *Start scan* it starts a scan `Pipeline` and
+//! feeds its items through it, interleaved with terminal input and redraws.
 //!
 //! No business logic lives here: every decision is delegated to an owning
 //! module. The shell only sequences them and moves data between them.
 
+use std::env;
 use std::fmt;
 use std::future::pending;
 use std::io;
@@ -22,8 +23,9 @@ use dynamodb_violation_detector::aws::{
 };
 use dynamodb_violation_detector::config::{self, CliArgs, ConfigError, ScanConfig};
 use dynamodb_violation_detector::pipeline::{Pipeline, now_epoch_secs};
+use dynamodb_violation_detector::profiles::{self, Profile, ProfileError};
 use dynamodb_violation_detector::scan::ScannedItem;
-use dynamodb_violation_detector::tui::{App, Command, ErrorModal, SetupScreen};
+use dynamodb_violation_detector::tui::{App, Command, ErrorModal, ProfilePicker, SetupScreen};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 use tokio::sync::mpsc;
@@ -42,46 +44,45 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
-            if let Some(hint) = err.remediation() {
-                eprintln!("  {hint}");
-            }
-
             ExitCode::FAILURE
         }
     }
 }
 
-/// Resolve configuration, build the client and discover the table, then run the
-/// TUI. Failures before the TUI starts surface on stderr (see [`main`]); once the
-/// TUI owns the terminal, terminal errors are shown as a modal instead.
+/// Resolve configuration and discover profiles, then run the TUI. Failures
+/// before the TUI starts surface on stderr (see [`main`]); once the TUI owns the
+/// terminal, errors are shown as a modal instead.
 async fn run(cli: CliArgs) -> Result<(), ShellError> {
     let config_path = resolve_config_path(&cli);
     let config = config::load(config_path.as_deref(), &cli)?;
 
-    let client: Arc<dyn DynamoClient> =
-        Arc::new(RealDynamoClient::new(config.profile.as_deref(), config.region.as_deref()).await);
-
-    let description = client.describe_table(&config.table).await?;
+    let env_profile = env::var_os("AWS_PROFILE").is_some();
+    let profiles = if needs_profile_picker(config_path.is_some(), env_profile, &cli) {
+        profiles::discover()?
+    } else {
+        Vec::new()
+    };
 
     let save_path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
     let shell = Shell {
-        client,
+        client: None,
         config,
-        description,
+        description: None,
         save_path,
     };
 
     let mut terminal = ratatui::try_init().map_err(ShellError::Io)?;
-    let result = shell.event_loop(&mut terminal).await;
+    let result = shell.event_loop(&mut terminal, profiles).await;
     ratatui::restore();
     result
 }
 
-/// Everything the event loop needs that is fixed for the program's lifetime.
+/// The state the event loop carries between screens. The client exists once a
+/// profile is settled; the description is the most recently described table.
 struct Shell {
-    client: Arc<dyn DynamoClient>,
+    client: Option<Arc<dyn DynamoClient>>,
     config: ScanConfig,
-    description: TableDescription,
+    description: Option<TableDescription>,
     save_path: PathBuf,
 }
 
@@ -91,9 +92,19 @@ impl Shell {
     /// writers never need to cross a task boundary. Redraws are driven by the
     /// frame ticker rather than per item, keeping a fast scan from starving the
     /// input handler.
-    async fn event_loop(mut self, terminal: &mut DefaultTerminal) -> Result<(), ShellError> {
-        let mut app = App::new(SetupScreen::new(&self.config, &self.description));
+    async fn event_loop(
+        mut self,
+        terminal: &mut DefaultTerminal,
+        profiles: Vec<Profile>,
+    ) -> Result<(), ShellError> {
         let mut modal: Option<ErrorModal> = None;
+        let mut app = if profiles.is_empty() {
+            let (setup, error) = self.open_setup().await;
+            modal = error;
+            App::new(setup)
+        } else {
+            App::pick_profile(ProfilePicker::new(profiles))
+        };
         let mut scan: Option<Pipeline> = None;
         let mut should_quit = false;
 
@@ -146,6 +157,21 @@ impl Shell {
         should_quit: &mut bool,
     ) {
         match command {
+            Command::SelectProfile(profile) => {
+                self.config.profile = Some(profile.name);
+                if self.config.region.is_none() {
+                    self.config.region = profile.region;
+                }
+
+                let (setup, error) = self.open_setup().await;
+                app.show_setup(setup);
+                *modal = error;
+            }
+            Command::SelectTable(name) => {
+                if let Err(err) = self.select_table(&name, app).await {
+                    *modal = Some(err);
+                }
+            }
             Command::StartScan => match self.start_scan(app).await {
                 Ok(pipeline) => {
                     *scan = Some(pipeline);
@@ -167,6 +193,69 @@ impl Shell {
         }
     }
 
+    /// Build the client for the settled profile, list its tables and describe
+    /// the configured table, if any. A failure is returned as a modal over the
+    /// setup screen, which still opens so the user can type a table or quit.
+    async fn open_setup(&mut self) -> (SetupScreen, Option<ErrorModal>) {
+        let client: Arc<dyn DynamoClient> = Arc::new(
+            RealDynamoClient::new(
+                self.config.profile.as_deref(),
+                self.config.region.as_deref(),
+            )
+            .await,
+        );
+        self.client = Some(Arc::clone(&client));
+
+        let table = &self.config.table;
+        let (tables, description) = tokio::join!(client.list_tables(), async {
+            if table.is_empty() {
+                Ok(None)
+            } else {
+                client.describe_table(table).await.map(Some)
+            }
+        });
+
+        let mut error = None;
+        let tables = tables.unwrap_or_else(|err| {
+            error = Some(ErrorModal::from(err));
+            Vec::new()
+        });
+        match description {
+            Ok(description) => self.description = description,
+            Err(err) => {
+                error.get_or_insert_with(|| ErrorModal::from(err));
+            }
+        }
+
+        let setup = SetupScreen::new(&self.config, self.description.as_ref(), tables);
+        (setup, error)
+    }
+
+    /// Describe the table chosen in the setup picker and rebuild the form's
+    /// index rows from it.
+    async fn select_table(&mut self, name: &str, app: &mut App) -> Result<(), ErrorModal> {
+        let client = self.client()?;
+        let description = client
+            .describe_table(name)
+            .await
+            .map_err(ErrorModal::from)?;
+        if let Some(setup) = app.setup_mut() {
+            setup.load_table(&description);
+        }
+
+        self.description = Some(description);
+        Ok(())
+    }
+
+    fn client(&self) -> Result<Arc<dyn DynamoClient>, ErrorModal> {
+        self.client.clone().ok_or_else(|| {
+            ErrorModal::message(
+                "No AWS client",
+                "choose an AWS profile before using the setup screen",
+            )
+        })
+    }
+
     /// Start a scan pipeline for the setup screen's current form: resolve the
     /// config and re-discover the table if its name changed.
     async fn start_scan(&mut self, app: &App) -> Result<Pipeline, ErrorModal> {
@@ -179,16 +268,19 @@ impl Shell {
             .map_err(|message| ErrorModal::message("Invalid scan settings", &message))?;
         config.profile = self.config.profile.clone();
 
-        if config.table != self.description.name {
-            self.description = self
-                .client
-                .describe_table(&config.table)
-                .await
-                .map_err(ErrorModal::from)?;
-        }
+        let client = self.client()?;
+        let description = match &mut self.description {
+            Some(description) if description.name == config.table => description,
+            slot => slot.insert(
+                client
+                    .describe_table(&config.table)
+                    .await
+                    .map_err(ErrorModal::from)?,
+            ),
+        };
 
         config::resolve_export_paths(&mut config, &timestamp());
-        let pipeline = Pipeline::start(&self.description, &config, Arc::clone(&self.client))?;
+        let pipeline = Pipeline::start(description, &config, client)?;
         self.config = config;
         Ok(pipeline)
     }
@@ -282,6 +374,18 @@ fn resolve_config_path(cli: &CliArgs) -> Option<PathBuf> {
     default.exists().then_some(default)
 }
 
+/// The profile picker runs only when nothing already targets the scan: no
+/// config file, no `AWS_PROFILE`, and no CLI override.
+fn needs_profile_picker(has_config_file: bool, env_profile: bool, cli: &CliArgs) -> bool {
+    !has_config_file
+        && !env_profile
+        && cli.table.is_none()
+        && cli.profile.is_none()
+        && cli.region.is_none()
+        && cli.segments.is_none()
+        && cli.rate_limit_percent.is_none()
+}
+
 /// A filesystem-safe timestamp for default export filenames. Epoch
 /// seconds avoid a calendar-formatting dependency while staying unique per scan.
 fn timestamp() -> String {
@@ -319,24 +423,15 @@ fn spawn_input_reader() -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
 #[derive(Debug)]
 enum ShellError {
     Config(ConfigError),
-    Aws(AwsError),
+    Profiles(ProfileError),
     Io(io::Error),
-}
-
-impl ShellError {
-    fn remediation(&self) -> Option<&'static str> {
-        match self {
-            ShellError::Aws(err) => err.remediation(),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for ShellError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ShellError::Config(err) => write!(f, "{err}"),
-            ShellError::Aws(err) => write!(f, "{err}"),
+            ShellError::Profiles(err) => write!(f, "{err}"),
             ShellError::Io(err) => write!(f, "{err}"),
         }
     }
@@ -346,7 +441,7 @@ impl std::error::Error for ShellError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ShellError::Config(err) => Some(err),
-            ShellError::Aws(err) => Some(err),
+            ShellError::Profiles(err) => Some(err),
             ShellError::Io(err) => Some(err),
         }
     }
@@ -358,9 +453,9 @@ impl From<ConfigError> for ShellError {
     }
 }
 
-impl From<AwsError> for ShellError {
-    fn from(err: AwsError) -> Self {
-        ShellError::Aws(err)
+impl From<ProfileError> for ShellError {
+    fn from(err: ProfileError) -> Self {
+        ShellError::Profiles(err)
     }
 }
 
@@ -378,5 +473,38 @@ mod tests {
             resolve_config_path(&cli),
             Some(PathBuf::from("/tmp/explicit.toml"))
         );
+    }
+
+    #[test]
+    fn profile_picker_runs_only_when_nothing_targets_the_scan() {
+        assert!(needs_profile_picker(false, false, &CliArgs::default()));
+        assert!(!needs_profile_picker(true, false, &CliArgs::default()));
+        assert!(!needs_profile_picker(false, true, &CliArgs::default()));
+
+        let overrides = [
+            CliArgs {
+                table: Some("t".to_string()),
+                ..CliArgs::default()
+            },
+            CliArgs {
+                profile: Some("p".to_string()),
+                ..CliArgs::default()
+            },
+            CliArgs {
+                region: Some("r".to_string()),
+                ..CliArgs::default()
+            },
+            CliArgs {
+                segments: Some(2),
+                ..CliArgs::default()
+            },
+            CliArgs {
+                rate_limit_percent: Some(50),
+                ..CliArgs::default()
+            },
+        ];
+        for cli in overrides {
+            assert!(!needs_profile_picker(false, false, &cli), "{cli:?}");
+        }
     }
 }

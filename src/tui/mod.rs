@@ -9,12 +9,15 @@ mod app;
 mod completed;
 mod error_modal;
 mod inflight;
+mod picker;
+mod profile_picker;
 mod setup;
 
 pub use app::{App, Command};
 pub use completed::CompletedScreen;
 pub use error_modal::ErrorModal;
 pub use inflight::InFlightScreen;
+pub use profile_picker::ProfilePicker;
 pub use setup::SetupScreen;
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -30,6 +33,21 @@ pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+/// The rendered cells of a test terminal as text, one line per row.
+#[cfg(test)]
+pub(super) fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area;
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+
+    text
 }
 
 /// Every violation category in a stable display order, shared by the in-flight

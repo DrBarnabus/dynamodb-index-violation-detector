@@ -1,10 +1,14 @@
 //! Setup screen.
 //!
 //! Renders the discovered table schema alongside the loaded config as an
-//! editable form: table name, region override, scan settings, export toggles
+//! editable form: table picker, region override, scan settings, export toggles
 //! and paths, TTL sub-checks, and a per-index `check_missing` toggle for every
 //! GSI/LSI. Hypothetical GSIs are authored in TOML (the in-TUI add-form is
 //! deferred) and appear tagged alongside the discovered indexes.
+//!
+//! The table field filters the `ListTables` result as the user types; choosing
+//! a table hands its name to the shell, which describes it and calls
+//! [`SetupScreen::load_table`] to rebuild the index and TTL rows.
 //!
 //! The screen holds the form state and exposes primitive mutations — navigate,
 //! toggle, edit — that the event loop drives from key events. On
@@ -21,8 +25,13 @@ use crate::aws::TableDescription;
 use crate::config::{ExportConfig, GsiEntry, LsiEntry, ScanConfig, TtlSettings};
 use crate::domain::KeySchemaElement;
 
+use super::picker::FuzzyList;
+
 /// The largest legal `rate_limit_percent` value.
 const MAX_RATE_LIMIT_PERCENT: u8 = 100;
+
+/// Table matches shown beneath the focused table field.
+const TABLE_LIST_ROWS: usize = 6;
 
 /// The TTL sub-checks in display order. Index positions are
 /// referenced by [`Focus::TtlCheck`].
@@ -75,9 +84,19 @@ struct LsiRow {
     key_desc: String,
 }
 
+/// The config's per-index and TTL intents, re-applied whenever a table is
+/// described so a later table choice still honours them.
+struct Intents {
+    gsi: Vec<GsiEntry>,
+    lsi: Vec<LsiEntry>,
+    ttl: Option<TtlSettings>,
+}
+
 /// The editable state of the setup screen.
 pub struct SetupScreen {
-    table: String,
+    intents: Intents,
+    table: FuzzyList,
+    loaded_table: Option<String>,
     region: String,
     segments: String,
     rate_limit: String,
@@ -93,21 +112,25 @@ pub struct SetupScreen {
 }
 
 impl SetupScreen {
-    /// Build the form from a loaded config and the table schema discovered via
-    /// `DescribeTable`.
+    /// Build the form from a loaded config, the tables offered by the picker,
+    /// and the schema of the configured table when it has been described.
     ///
     /// Discovered GSIs/LSIs seed the rows; a config `check_missing` intent for a
     /// matching name is carried over. Hypothetical GSIs from the config are
     /// appended, tagged, and shown with their declared key schema.
-    pub fn new(config: &ScanConfig, description: &TableDescription) -> Self {
-        let gsis = build_gsi_rows(config, description);
-        let lsis = build_lsi_rows(config, description);
-        let ttl = build_ttl_row(config, description);
-
-        let order = build_order(ttl.as_ref(), gsis.len(), lsis.len());
-
-        Self {
-            table: config.table.clone(),
+    pub fn new(
+        config: &ScanConfig,
+        description: Option<&TableDescription>,
+        tables: Vec<String>,
+    ) -> Self {
+        let mut screen = Self {
+            intents: Intents {
+                gsi: config.gsi.clone(),
+                lsi: config.lsi.clone(),
+                ttl: config.ttl.clone(),
+            },
+            table: FuzzyList::new(tables, &config.table),
+            loaded_table: None,
             region: config.region.clone().unwrap_or_default(),
             segments: config.segments.to_string(),
             rate_limit: config
@@ -118,12 +141,71 @@ impl SetupScreen {
             csv_path: path_to_string(&config.export.csv_path),
             ndjson: config.export.ndjson,
             ndjson_path: path_to_string(&config.export.ndjson_path),
-            ttl,
-            gsis,
-            lsis,
-            order,
+            ttl: None,
+            gsis: Vec::new(),
+            lsis: Vec::new(),
+            order: Vec::new(),
             focus: 0,
+        };
+        screen.rebuild_rows(description);
+        screen
+    }
+
+    /// Rebuild the index and TTL rows for a newly described table, keeping
+    /// focus on the same control where it still exists.
+    pub fn load_table(&mut self, description: &TableDescription) {
+        self.table.set_query(&description.name);
+        self.rebuild_rows(Some(description));
+    }
+
+    fn rebuild_rows(&mut self, description: Option<&TableDescription>) {
+        let focused = self.order.get(self.focus).copied();
+
+        self.gsis = build_gsi_rows(&self.intents.gsi, description);
+        self.lsis = build_lsi_rows(&self.intents.lsi, description);
+        self.ttl = build_ttl_row(self.intents.ttl.as_ref(), description);
+        self.order = build_order(self.ttl.as_ref(), self.gsis.len(), self.lsis.len());
+        self.focus = focused
+            .and_then(|focused| self.order.iter().position(|f| *f == focused))
+            .unwrap_or(0);
+        self.loaded_table = description.map(|d| d.name.clone());
+    }
+
+    /// True when the table field is focused and has matches to move through,
+    /// so the event loop routes ↑/↓ to the list rather than between fields.
+    pub fn is_table_list_active(&self) -> bool {
+        self.is_table_focused() && self.table.has_matches()
+    }
+
+    pub fn table_list_next(&mut self) {
+        self.table.select_next();
+    }
+
+    pub fn table_list_prev(&mut self) {
+        self.table.select_prev();
+    }
+
+    /// Commit the table field: the highlighted match, or the typed name when
+    /// nothing matches (e.g. `ListTables` is not permitted). Advances focus and
+    /// returns the name when it still needs describing; `None` when the field
+    /// is empty or the table is already loaded.
+    pub fn choose_table(&mut self) -> Option<String> {
+        let name = match self.table.selected() {
+            Some(name) => name.to_string(),
+            None => self.table.query().trim().to_string(),
+        };
+        if name.is_empty() {
+            return None;
         }
+
+        self.table.set_query(&name);
+        self.focus_next();
+        (self.loaded_table.as_deref() != Some(name.as_str())).then_some(name)
+    }
+
+    /// True when the table field is focused.
+    pub fn is_table_focused(&self) -> bool {
+        self.order[self.focus] == Focus::Table
     }
 
     /// Move focus to the next control, wrapping at the end.
@@ -199,21 +281,16 @@ impl SetupScreen {
 
     /// Delete the last character of the focused text field.
     pub fn backspace(&mut self) {
-        if let Some(field) = self.focused_text_field() {
-            field.pop();
-        }
-    }
-
-    fn focused_text_field(&mut self) -> Option<&mut String> {
-        match self.order[self.focus] {
-            Focus::Table => Some(&mut self.table),
-            Focus::Region => Some(&mut self.region),
-            Focus::Segments => Some(&mut self.segments),
-            Focus::RateLimit => Some(&mut self.rate_limit),
-            Focus::CsvPath => Some(&mut self.csv_path),
-            Focus::NdjsonPath => Some(&mut self.ndjson_path),
-            _ => None,
-        }
+        let field = match self.order[self.focus] {
+            Focus::Table => return self.table.backspace(),
+            Focus::Region => &mut self.region,
+            Focus::Segments => &mut self.segments,
+            Focus::RateLimit => &mut self.rate_limit,
+            Focus::CsvPath => &mut self.csv_path,
+            Focus::NdjsonPath => &mut self.ndjson_path,
+            _ => return,
+        };
+        field.pop();
     }
 
     /// Project the form back onto a [`ScanConfig`] for the scan driver.
@@ -221,7 +298,7 @@ impl SetupScreen {
     /// Validates the same scalar constraints as the config loader; returns an
     /// actionable message rather than a partially-built config on failure.
     pub fn to_scan_config(&self) -> Result<ScanConfig, String> {
-        let table = self.table.trim();
+        let table = self.table.query().trim();
         if table.is_empty() {
             return Err("Table name is required; type a table to scan.".to_string());
         }
@@ -289,7 +366,24 @@ impl SetupScreen {
         let mut b = LineBuilder::new(self.order.get(self.focus).copied());
 
         b.header("AWS");
-        b.text_field(Focus::Table, "Table", &self.table, None);
+        b.text_field(
+            Focus::Table,
+            "Table",
+            self.table.query(),
+            Some("type to filter"),
+        );
+        if self.is_table_focused() && self.table.has_items() {
+            let matches = self
+                .table
+                .lines(TABLE_LIST_ROWS, |i| format!("      {}", self.table.item(i)));
+            if matches.is_empty() {
+                b.hint("      no listed table matches; enter uses the typed name");
+            }
+            b.lines.extend(matches);
+        }
+        if self.loaded_table.is_none() {
+            b.hint("  choose a table to discover its indexes and TTL");
+        }
         b.text_field(
             Focus::Region,
             "Region override",
@@ -348,7 +442,7 @@ impl SetupScreen {
 
         b.blank();
         b.button(Focus::Start, "Start scan");
-        b.hint("↑/↓ move · space toggle · type to edit · enter start · q quit");
+        b.hint("↑/↓ move · space toggle · type to edit · enter choose / start · esc quit");
 
         (b.lines, b.focused_line)
     }
@@ -444,13 +538,13 @@ impl LineBuilder {
     }
 }
 
-fn build_gsi_rows(config: &ScanConfig, description: &TableDescription) -> Vec<GsiRow> {
+fn build_gsi_rows(intents: &[GsiEntry], description: Option<&TableDescription>) -> Vec<GsiRow> {
     let mut rows: Vec<GsiRow> = description
-        .gsis
+        .map(|d| d.gsis.as_slice())
+        .unwrap_or_default()
         .iter()
         .map(|schema| {
-            let check_missing = config
-                .gsi
+            let check_missing = intents
                 .iter()
                 .find(|g| !g.hypothetical && g.name == schema.name)
                 .is_some_and(|g| g.check_missing);
@@ -467,7 +561,7 @@ fn build_gsi_rows(config: &ScanConfig, description: &TableDescription) -> Vec<Gs
         })
         .collect();
 
-    for entry in config.gsi.iter().filter(|g| g.hypothetical) {
+    for entry in intents.iter().filter(|g| g.hypothetical) {
         let key_desc = match &entry.pk {
             Some(pk) => fmt_key(pk, entry.sk.as_ref()),
             None => "no key schema".to_string(),
@@ -481,13 +575,13 @@ fn build_gsi_rows(config: &ScanConfig, description: &TableDescription) -> Vec<Gs
     rows
 }
 
-fn build_lsi_rows(config: &ScanConfig, description: &TableDescription) -> Vec<LsiRow> {
+fn build_lsi_rows(intents: &[LsiEntry], description: Option<&TableDescription>) -> Vec<LsiRow> {
     description
-        .lsis
+        .map(|d| d.lsis.as_slice())
+        .unwrap_or_default()
         .iter()
         .map(|schema| {
-            let check_missing = config
-                .lsi
+            let check_missing = intents
                 .iter()
                 .find(|l| l.name == schema.name)
                 .is_some_and(|l| l.check_missing);
@@ -502,9 +596,12 @@ fn build_lsi_rows(config: &ScanConfig, description: &TableDescription) -> Vec<Ls
         .collect()
 }
 
-fn build_ttl_row(config: &ScanConfig, description: &TableDescription) -> Option<TtlRow> {
-    let ttl = description.ttl.as_ref()?;
-    let settings = config.ttl.clone().unwrap_or_default();
+fn build_ttl_row(
+    intent: Option<&TtlSettings>,
+    description: Option<&TableDescription>,
+) -> Option<TtlRow> {
+    let ttl = description?.ttl.as_ref()?;
+    let settings = intent.cloned().unwrap_or_default();
     Some(TtlRow {
         attribute: ttl.attribute.clone(),
         enabled: settings.enabled.unwrap_or(true),
@@ -663,9 +760,9 @@ mod tests {
 
     #[test]
     fn seeds_scalar_fields_from_config() {
-        let screen = SetupScreen::new(&config(), &description());
+        let screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
 
-        assert_eq!(screen.table, "users");
+        assert_eq!(screen.table.query(), "users");
         assert_eq!(screen.region, "eu-west-1");
         assert_eq!(screen.segments, "8");
         assert_eq!(screen.rate_limit, "60");
@@ -679,14 +776,14 @@ mod tests {
         cfg.rate_limit_percent = None;
         cfg.region = None;
 
-        let screen = SetupScreen::new(&cfg, &description());
+        let screen = SetupScreen::new(&cfg, Some(&description()), Vec::new());
         assert_eq!(screen.rate_limit, "");
         assert_eq!(screen.region, "");
     }
 
     #[test]
     fn gsi_rows_union_discovered_and_hypothetical_with_carried_intent() {
-        let screen = SetupScreen::new(&config(), &description());
+        let screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
 
         assert_eq!(screen.gsis.len(), 2);
 
@@ -704,7 +801,7 @@ mod tests {
 
     #[test]
     fn lsi_rows_carry_missing_intent() {
-        let screen = SetupScreen::new(&config(), &description());
+        let screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
 
         assert_eq!(screen.lsis.len(), 1);
         assert!(screen.lsis[0].entry.check_missing);
@@ -712,7 +809,7 @@ mod tests {
 
     #[test]
     fn ttl_row_defaults_when_config_absent_but_attribute_discovered() {
-        let screen = SetupScreen::new(&config(), &description());
+        let screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
 
         let ttl = screen.ttl.as_ref().expect("ttl row present");
         assert_eq!(ttl.attribute, "expiresAt");
@@ -725,14 +822,14 @@ mod tests {
         let mut desc = description();
         desc.ttl = None;
 
-        let screen = SetupScreen::new(&config(), &desc);
+        let screen = SetupScreen::new(&config(), Some(&desc), Vec::new());
         assert!(screen.ttl.is_none());
         assert!(!screen.order.contains(&Focus::TtlEnabled));
     }
 
     #[test]
     fn focus_navigation_wraps_both_directions() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         assert_eq!(screen.order[screen.focus], Focus::Table);
 
         screen.focus_prev();
@@ -745,7 +842,7 @@ mod tests {
 
     #[test]
     fn toggle_flips_focused_check_missing() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Gsi(1));
 
         assert!(!screen.gsis[1].entry.check_missing);
@@ -755,27 +852,27 @@ mod tests {
 
     #[test]
     fn toggle_is_noop_on_text_field() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Table);
-        let before = screen.table.clone();
+        let before = screen.table.query().to_string();
 
         screen.toggle();
-        assert_eq!(screen.table, before);
+        assert_eq!(screen.table.query(), before);
     }
 
     #[test]
     fn input_and_backspace_edit_focused_text_field() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Table);
         screen.backspace();
         screen.input_char('X');
 
-        assert_eq!(screen.table, "userX");
+        assert_eq!(screen.table.query(), "userX");
     }
 
     #[test]
     fn numeric_fields_reject_non_digits() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Segments);
         screen.input_char('a');
         assert_eq!(screen.segments, "8");
@@ -786,7 +883,7 @@ mod tests {
 
     #[test]
     fn to_scan_config_round_trips_indexes_and_ttl() {
-        let screen = SetupScreen::new(&config(), &description());
+        let screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         let resolved = screen.to_scan_config().expect("valid form");
 
         assert_eq!(resolved.table, "users");
@@ -806,7 +903,7 @@ mod tests {
 
     #[test]
     fn to_scan_config_reflects_edits() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Ndjson);
         screen.toggle();
         focus_on(&mut screen, Focus::NdjsonPath);
@@ -824,15 +921,15 @@ mod tests {
 
     #[test]
     fn to_scan_config_rejects_empty_table() {
-        let mut screen = SetupScreen::new(&config(), &description());
-        screen.table.clear();
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        screen.table.set_query("");
 
         assert!(screen.to_scan_config().is_err());
     }
 
     #[test]
     fn to_scan_config_rejects_zero_segments() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         screen.segments = "0".to_string();
 
         assert!(screen.to_scan_config().is_err());
@@ -840,7 +937,7 @@ mod tests {
 
     #[test]
     fn to_scan_config_rejects_out_of_range_rate() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         screen.rate_limit = "150".to_string();
 
         assert!(screen.to_scan_config().is_err());
@@ -848,7 +945,7 @@ mod tests {
 
     #[test]
     fn blank_rate_limit_is_unlimited() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         screen.rate_limit.clear();
 
         assert_eq!(screen.to_scan_config().unwrap().rate_limit_percent, None);
@@ -861,22 +958,12 @@ mod tests {
             .draw(|frame| screen.render(frame, frame.area()))
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let area = buffer.area;
-        let mut text = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-
-        text
+        crate::tui::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
     fn render_shows_key_facts() {
-        let screen = SetupScreen::new(&config(), &description());
+        let screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         let text = buffer_text(&screen);
 
         assert!(text.contains("Scan setup"));
@@ -889,7 +976,7 @@ mod tests {
 
     #[test]
     fn render_scrolls_focused_control_into_view() {
-        let mut screen = SetupScreen::new(&config(), &description());
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Start);
 
         let backend = TestBackend::new(90, 12);
@@ -898,19 +985,111 @@ mod tests {
             .draw(|frame| screen.render(frame, frame.area()))
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let area = buffer.area;
-        let mut text = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-
+        let text = crate::tui::buffer_text(terminal.backend().buffer());
         assert!(
             text.contains("Start scan"),
             "focused button must be visible"
         );
+    }
+
+    fn tables() -> Vec<String> {
+        ["orders", "prod-orders", "users"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn unloaded() -> SetupScreen {
+        let mut cfg = config();
+        cfg.table = String::new();
+        SetupScreen::new(&cfg, None, tables())
+    }
+
+    #[test]
+    fn without_a_described_table_only_hypothetical_rows_show() {
+        let screen = unloaded();
+
+        assert_eq!(screen.loaded_table, None);
+        assert_eq!(screen.gsis.len(), 1);
+        assert!(screen.gsis[0].entry.hypothetical);
+        assert!(screen.lsis.is_empty());
+        assert!(screen.ttl.is_none());
+        assert!(buffer_text(&screen).contains("choose a table"));
+    }
+
+    #[test]
+    fn load_table_rebuilds_rows_and_keeps_focus() {
+        let mut screen = unloaded();
+        focus_on(&mut screen, Focus::Region);
+
+        screen.load_table(&description());
+
+        assert_eq!(screen.loaded_table.as_deref(), Some("users"));
+        assert_eq!(screen.table.query(), "users");
+        assert_eq!(screen.gsis.len(), 2);
+        assert!(screen.gsis[0].entry.check_missing, "config intent carried");
+        assert_eq!(screen.lsis.len(), 1);
+        assert!(screen.ttl.is_some());
+        assert!(screen.order.contains(&Focus::TtlEnabled));
+        assert_eq!(screen.order[screen.focus], Focus::Region);
+    }
+
+    #[test]
+    fn typing_filters_tables_and_choose_picks_the_highlight() {
+        let mut screen = unloaded();
+        for c in "ord".chars() {
+            screen.input_char(c);
+        }
+        screen.table_list_next();
+
+        assert!(screen.is_table_list_active());
+        assert_eq!(screen.choose_table().as_deref(), Some("prod-orders"));
+        assert_eq!(screen.table.query(), "prod-orders");
+        assert_eq!(screen.order[screen.focus], Focus::Region);
+        assert!(!screen.is_table_list_active());
+    }
+
+    #[test]
+    fn choose_table_skips_the_already_loaded_table() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), tables());
+        assert_eq!(screen.choose_table(), None);
+        assert_eq!(screen.order[screen.focus], Focus::Region);
+    }
+
+    #[test]
+    fn choose_table_falls_back_to_the_typed_name() {
+        let mut screen = unloaded();
+        assert_eq!(screen.choose_table(), Some("orders".to_string()));
+
+        let mut screen = unloaded();
+        for c in "unlisted".chars() {
+            screen.input_char(c);
+        }
+        assert!(!screen.is_table_list_active());
+        assert_eq!(screen.choose_table().as_deref(), Some("unlisted"));
+
+        let mut screen = SetupScreen::new(&config(), None, Vec::new());
+        screen.table.set_query("  ");
+        assert_eq!(screen.choose_table(), None);
+        assert!(screen.is_table_focused());
+    }
+
+    #[test]
+    fn render_lists_matching_tables_while_the_field_is_focused() {
+        let mut screen = unloaded();
+        screen.input_char('u');
+        let text = buffer_text(&screen);
+        assert!(text.contains("users"));
+        assert!(!text.contains("prod-orders"));
+
+        focus_on(&mut screen, Focus::Region);
+        assert!(!buffer_text(&screen).contains("      users"));
+    }
+
+    #[test]
+    fn render_explains_an_unmatched_query() {
+        let mut screen = unloaded();
+        screen.input_char('z');
+        assert!(buffer_text(&screen).contains("no listed table matches"));
     }
 }

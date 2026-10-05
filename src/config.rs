@@ -27,6 +27,8 @@ use crate::domain::KeySchemaElement;
 /// [`crate::aws::TableDescription`] to build the [`crate::rules::RuleSet`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanConfig {
+    /// Empty when neither the CLI nor the file names a table; the setup
+    /// screen's picker then supplies one.
     pub table: String,
     pub region: Option<String>,
     pub profile: Option<String>,
@@ -186,7 +188,6 @@ pub enum ConfigError {
     },
     Parse(toml::de::Error),
     Serialize(toml::ser::Error),
-    MissingTable,
     EmptyTable,
     EmptyIndexName,
     DuplicateGsi(String),
@@ -208,10 +209,6 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::Parse(e) => write!(f, "invalid TOML: {e}"),
             ConfigError::Serialize(e) => write!(f, "cannot serialise config: {e}"),
-            ConfigError::MissingTable => write!(
-                f,
-                "no table specified; set `table` in the config or pass --table"
-            ),
             ConfigError::EmptyTable => {
                 write!(f, "`table` must be a non-empty table name")
             }
@@ -362,18 +359,16 @@ pub fn load(path: Option<&Path>, cli: &CliArgs) -> Result<ScanConfig, ConfigErro
 /// Export paths are intentionally left unresolved (`None`) — timestamped default
 /// templating needs a clock and belongs to the save/shell layer.
 pub fn merge(file: Option<ConfigFile>, cli: &CliArgs) -> Result<ScanConfig, ConfigError> {
-    let table = match cli
+    let table = cli
         .table
         .clone()
-        .or_else(|| file.as_ref().map(|f| f.table.clone()))
-    {
-        Some(table) => table,
-        None => return Err(ConfigError::MissingTable),
-    };
+        .or_else(|| file.as_ref().map(|f| f.table.clone()));
 
-    if table.trim().is_empty() {
+    if table.as_ref().is_some_and(|t| t.trim().is_empty()) {
         return Err(ConfigError::EmptyTable);
     }
+
+    let table = table.unwrap_or_default();
 
     let segments = cli
         .segments
@@ -808,9 +803,8 @@ name = "dup"
     }
 
     #[test]
-    fn missing_table_everywhere_is_rejected() {
-        let err = merge(None, &cli()).unwrap_err();
-        assert!(matches!(err, ConfigError::MissingTable));
+    fn missing_table_everywhere_is_left_for_the_picker() {
+        assert_eq!(merge(None, &cli()).unwrap().table, "");
     }
 
     #[test]
