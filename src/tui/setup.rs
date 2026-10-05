@@ -3,8 +3,8 @@
 //! Renders the discovered table schema alongside the loaded config as an
 //! editable form: table picker, region override, scan settings, export toggles
 //! and paths, TTL sub-checks, and a per-index `check_missing` toggle for every
-//! GSI/LSI. Hypothetical GSIs are authored in TOML (the in-TUI add-form is
-//! deferred) and appear tagged alongside the discovered indexes.
+//! GSI/LSI. Hypothetical GSIs, from TOML or the *Add hypothetical GSI* form,
+//! appear tagged alongside the discovered indexes.
 //!
 //! The table field filters the `ListTables` result as the user types; choosing
 //! a table hands its name to the shell, which describes it and calls
@@ -27,6 +27,7 @@ use crate::aws::TableDescription;
 use crate::config::{ExportConfig, GsiEntry, LsiEntry, ScanConfig, TtlSettings};
 use crate::domain::KeySchemaElement;
 
+use super::gsi_form::GsiForm;
 use super::picker::FuzzyList;
 
 /// The largest legal `rate_limit_percent` value.
@@ -59,6 +60,7 @@ enum Focus {
     TtlEnabled,
     TtlCheck(usize),
     Gsi(usize),
+    AddGsi,
     Lsi(usize),
     Start,
 }
@@ -112,6 +114,7 @@ pub struct SetupScreen {
     lsis: Vec<LsiRow>,
     order: Vec<Focus>,
     focus: usize,
+    gsi_form: Option<GsiForm>,
 }
 
 impl SetupScreen {
@@ -150,6 +153,7 @@ impl SetupScreen {
             lsis: Vec::new(),
             order: Vec::new(),
             focus: 0,
+            gsi_form: None,
         };
         screen.rebuild_rows(description);
         screen
@@ -197,11 +201,15 @@ impl SetupScreen {
         self.gsis = build_gsi_rows(&self.intents.gsi, description);
         self.lsis = build_lsi_rows(&self.intents.lsi, description);
         self.ttl = build_ttl_row(self.intents.ttl.as_ref(), description);
+        self.rebuild_order(focused);
+        self.loaded_table = description.map(|d| d.name.clone());
+    }
+
+    fn rebuild_order(&mut self, focused: Option<Focus>) {
         self.order = build_order(self.ttl.as_ref(), self.gsis.len(), self.lsis.len());
         self.focus = focused
             .and_then(|focused| self.order.iter().position(|f| *f == focused))
             .unwrap_or(0);
-        self.loaded_table = description.map(|d| d.name.clone());
     }
 
     /// True when the table field is focused and has matches to move through,
@@ -269,6 +277,64 @@ impl SetupScreen {
                 | Focus::CsvPath
                 | Focus::NdjsonPath
         )
+    }
+
+    /// True when *Add hypothetical GSI* is focused, so the event loop can turn
+    /// an `Enter` into opening the add-form.
+    pub fn is_add_gsi_focused(&self) -> bool {
+        self.order[self.focus] == Focus::AddGsi
+    }
+
+    pub fn open_gsi_form(&mut self) {
+        self.gsi_form = Some(GsiForm::new());
+    }
+
+    pub fn close_gsi_form(&mut self) {
+        self.gsi_form = None;
+    }
+
+    /// The open add-form, which takes all key input while raised.
+    pub(super) fn gsi_form_mut(&mut self) -> Option<&mut GsiForm> {
+        self.gsi_form.as_mut()
+    }
+
+    /// Validate the open add-form and, when valid, append its index as a
+    /// focused hypothetical row and close the form. An invalid form stays open
+    /// showing why.
+    pub fn submit_gsi_form(&mut self) {
+        let Some(form) = &mut self.gsi_form else {
+            return;
+        };
+        let taken = self.gsis.iter().map(|row| row.entry.name.as_str());
+        let Some(entry) = form.build(taken) else {
+            return;
+        };
+
+        self.gsi_form = None;
+        self.intents.gsi.push(entry.clone());
+        self.gsis.push(hypothetical_row(entry));
+        self.rebuild_order(Some(Focus::Gsi(self.gsis.len() - 1)));
+    }
+
+    /// Remove the focused GSI when it is hypothetical; discovered indexes stay.
+    pub fn remove_focused_gsi(&mut self) {
+        let Focus::Gsi(i) = self.order[self.focus] else {
+            return;
+        };
+        if !self.gsis[i].entry.hypothetical {
+            return;
+        }
+
+        let removed = self.gsis.remove(i);
+        self.intents
+            .gsi
+            .retain(|g| !(g.hypothetical && g.name == removed.entry.name));
+        let next = if i < self.gsis.len() {
+            Focus::Gsi(i)
+        } else {
+            Focus::AddGsi
+        };
+        self.rebuild_order(Some(next));
     }
 
     /// Flip the focused toggle. No-op on text fields and the Start button.
@@ -393,6 +459,10 @@ impl SetupScreen {
             .min(lines.len().saturating_sub(height)) as u16;
 
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+
+        if let Some(form) = &self.gsi_form {
+            form.render(frame, area);
+        }
     }
 
     fn build_lines(&self) -> (Vec<Line<'static>>, usize) {
@@ -452,18 +522,17 @@ impl SetupScreen {
             }
         }
 
-        if !self.gsis.is_empty() {
-            b.header("GSIs  (type + size checks always on)");
-            for (i, row) in self.gsis.iter().enumerate() {
-                let label = format!(
-                    "{} {}  {}  — check missing key",
-                    row.entry.name,
-                    tag(row.entry.hypothetical),
-                    row.key_desc,
-                );
-                b.toggle(Focus::Gsi(i), &label, row.entry.check_missing, 0);
-            }
+        b.header("GSIs  (type + size checks always on)");
+        for (i, row) in self.gsis.iter().enumerate() {
+            let label = format!(
+                "{} {}  {}  — check missing key",
+                row.entry.name,
+                tag(row.entry.hypothetical),
+                row.key_desc,
+            );
+            b.toggle(Focus::Gsi(i), &label, row.entry.check_missing, 0);
         }
+        b.button(Focus::AddGsi, "+ Add hypothetical GSI");
 
         if !self.lsis.is_empty() {
             b.header("LSIs");
@@ -476,6 +545,7 @@ impl SetupScreen {
         b.blank();
         b.button(Focus::Start, "Start scan");
         b.hint("↑/↓ move · space toggle · type to edit · enter choose / start · esc quit");
+        b.hint("del removes a hypothetical GSI");
 
         (b.lines, b.focused_line)
     }
@@ -594,18 +664,22 @@ fn build_gsi_rows(intents: &[GsiEntry], description: Option<&TableDescription>) 
         })
         .collect();
 
-    for entry in intents.iter().filter(|g| g.hypothetical) {
-        let key_desc = match &entry.pk {
-            Some(pk) => fmt_key(pk, entry.sk.as_ref()),
-            None => "no key schema".to_string(),
-        };
-        rows.push(GsiRow {
-            entry: entry.clone(),
-            key_desc,
-        });
-    }
-
+    rows.extend(
+        intents
+            .iter()
+            .filter(|g| g.hypothetical)
+            .cloned()
+            .map(hypothetical_row),
+    );
     rows
+}
+
+fn hypothetical_row(entry: GsiEntry) -> GsiRow {
+    let key_desc = match &entry.pk {
+        Some(pk) => fmt_key(pk, entry.sk.as_ref()),
+        None => "no key schema".to_string(),
+    };
+    GsiRow { entry, key_desc }
 }
 
 fn build_lsi_rows(intents: &[LsiEntry], description: Option<&TableDescription>) -> Vec<LsiRow> {
@@ -666,6 +740,7 @@ fn build_order(ttl: Option<&TtlRow>, gsi_count: usize, lsi_count: usize) -> Vec<
     }
 
     order.extend((0..gsi_count).map(Focus::Gsi));
+    order.push(Focus::AddGsi);
     order.extend((0..lsi_count).map(Focus::Lsi));
     order.push(Focus::Start);
     order
@@ -1154,6 +1229,69 @@ mod tests {
         screen.region.clear();
         screen.focus_next();
         assert_eq!(screen.take_region_change(), Some(None), "profile default");
+    }
+
+    fn submit_form(screen: &mut SetupScreen, name: &str, pk: &str) {
+        focus_on(screen, Focus::AddGsi);
+        screen.open_gsi_form();
+        let form = screen.gsi_form_mut().expect("form open");
+        name.chars().for_each(|c| form.input_char(c));
+        form.focus_next();
+        pk.chars().for_each(|c| form.input_char(c));
+        screen.submit_gsi_form();
+    }
+
+    #[test]
+    fn submitted_gsi_form_appends_a_focused_hypothetical_row_that_survives_reloads() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        submit_form(&mut screen, "byOrg", "orgId");
+
+        assert!(screen.gsi_form.is_none());
+        assert_eq!(screen.gsis.len(), 3);
+        assert_eq!(screen.order[screen.focus], Focus::Gsi(2));
+        assert_eq!(screen.gsis[2].key_desc, "pk orgId(S)");
+
+        screen.unload_table();
+        screen.load_table(&description());
+        let resolved = screen.to_scan_config().unwrap();
+        let added = resolved.gsi.iter().find(|g| g.name == "byOrg").unwrap();
+        assert!(added.hypothetical);
+    }
+
+    #[test]
+    fn invalid_gsi_form_stays_open_and_adds_nothing() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        submit_form(&mut screen, "GSI1", "orgId");
+
+        assert!(screen.gsi_form.is_some());
+        assert_eq!(screen.gsis.len(), 2);
+        assert!(buffer_text(&screen).contains("already exists"));
+    }
+
+    #[test]
+    fn remove_focused_gsi_drops_only_hypothetical_rows() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        focus_on(&mut screen, Focus::Gsi(0));
+        screen.remove_focused_gsi();
+        assert_eq!(screen.gsis.len(), 2, "discovered index kept");
+
+        focus_on(&mut screen, Focus::Gsi(1));
+        screen.remove_focused_gsi();
+        assert_eq!(screen.gsis.len(), 1);
+        assert_eq!(screen.order[screen.focus], Focus::AddGsi);
+
+        screen.unload_table();
+        assert!(screen.gsis.is_empty(), "removal reaches the intents");
+    }
+
+    #[test]
+    fn add_gsi_button_shows_without_any_index() {
+        let mut cfg = config();
+        cfg.gsi.clear();
+        let screen = SetupScreen::new(&cfg, None, Vec::new());
+
+        assert!(screen.order.contains(&Focus::AddGsi));
+        assert!(buffer_text(&screen).contains("+ Add hypothetical GSI"));
     }
 
     #[test]

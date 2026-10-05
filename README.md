@@ -88,9 +88,17 @@ Setup screen:
 - On the table field, type to filter; `↑`/`↓` move through matching tables and
   `Enter` chooses the highlighted one (or the typed name when nothing matches)
 - `Space` — toggle a checkbox
-- `Enter` — next field, or start the scan on *Start scan*
+- `Enter` — next field, open the add-form on *+ Add hypothetical GSI*, or start
+  the scan on *Start scan*
+- `Delete` / `Backspace` on a hypothetical GSI — remove it
 - `Ctrl+S` — save the form to the config file
 - `Esc` — quit
+
+The *Add hypothetical GSI* form takes an index name, a partition key attribute
+and type, and an optional sort key attribute and type. `Tab` / `↑` / `↓` move
+between fields, `Space` or `←`/`→` change a key type, `Enter` on *Add index*
+adds it, and `Esc` cancels. Added indexes are tagged `[hypothetical]` and saved
+with `Ctrl+S`.
 
 In-flight screen:
 

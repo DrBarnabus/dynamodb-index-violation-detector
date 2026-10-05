@@ -174,6 +174,11 @@ fn handle_setup(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
 }
 
 fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
+    if setup.gsi_form_mut().is_some() {
+        handle_gsi_form(setup, key);
+        return None;
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => return Some(Command::Quit),
@@ -191,7 +196,15 @@ fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
                 return setup.choose_table().map(Command::SelectTable);
             }
 
+            if setup.is_add_gsi_focused() {
+                setup.open_gsi_form();
+                return None;
+            }
+
             setup.focus_next();
+        }
+        KeyCode::Backspace | KeyCode::Delete if !setup.focus_is_text() => {
+            setup.remove_focused_gsi();
         }
         KeyCode::Backspace => setup.backspace(),
         KeyCode::Char(' ') if !setup.focus_is_text() => setup.toggle(),
@@ -200,6 +213,23 @@ fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
     }
 
     None
+}
+
+fn handle_gsi_form(setup: &mut SetupScreen, key: KeyEvent) {
+    let Some(form) = setup.gsi_form_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => setup.close_gsi_form(),
+        KeyCode::Enter if form.is_add_focused() => setup.submit_gsi_form(),
+        KeyCode::Tab | KeyCode::Down | KeyCode::Enter => form.focus_next(),
+        KeyCode::BackTab | KeyCode::Up => form.focus_prev(),
+        KeyCode::Char(' ') | KeyCode::Right if form.is_type_focused() => form.cycle_type(true),
+        KeyCode::Left if form.is_type_focused() => form.cycle_type(false),
+        KeyCode::Backspace => form.backspace(),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => form.input_char(c),
+        _ => {}
+    }
 }
 
 fn handle_inflight(inflight: &mut InFlightScreen, key: KeyEvent) -> Option<Command> {
@@ -236,7 +266,7 @@ fn handle_completed(completed: &mut CompletedScreen, key: KeyEvent) -> Option<Co
 }
 
 fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let modal = centered(area, 50, 12);
+    let modal = centered(area, 50, 13);
     frame.render_widget(Clear, modal);
 
     let block = Block::default()
@@ -256,7 +286,8 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
         bind("j/k", "move (completed screen)"),
         bind("Tab", "next field"),
         bind("Space", "toggle"),
-        bind("Enter", "choose / start scan"),
+        bind("Enter", "choose / add GSI / start scan"),
+        bind("Del", "remove hypothetical GSI"),
         bind("Ctrl+S", "save config"),
         bind("Ctrl+C", "cancel scan"),
         bind("q / Esc", "quit or cancel scan"),
@@ -431,6 +462,76 @@ mod tests {
             Some(Command::ChangeRegion(Some("x".to_string())))
         );
         assert_eq!(app.handle_key(key(KeyCode::BackTab)), None);
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn setup_adds_and_removes_a_hypothetical_gsi_from_the_keyboard() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        assert!(app.setup().unwrap().is_add_gsi_focused());
+
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "byEmail");
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "email");
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.handle_key(ctrl(KeyCode::Char('s'))), None);
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+
+        let gsi = &app.setup().unwrap().to_scan_config().unwrap().gsi;
+        assert_eq!(gsi.len(), 1);
+        assert_eq!(gsi[0].name, "byEmail");
+        assert_eq!(
+            gsi[0].pk,
+            Some(KeySchemaElement {
+                name: "email".to_string(),
+                type_code: TypeCode::N,
+            })
+        );
+        assert_eq!(gsi[0].sk, None);
+
+        app.handle_key(key(KeyCode::Delete));
+        assert!(
+            app.setup()
+                .unwrap()
+                .to_scan_config()
+                .unwrap()
+                .gsi
+                .is_empty()
+        );
+        assert!(app.setup().unwrap().is_add_gsi_focused());
+    }
+
+    #[test]
+    fn setup_esc_closes_the_gsi_form_without_quitting() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "q");
+        assert!(render_text(&app, None).contains("Partition key"));
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert!(!render_text(&app, None).contains("Partition key"));
+        assert!(
+            app.setup()
+                .unwrap()
+                .to_scan_config()
+                .unwrap()
+                .gsi
+                .is_empty()
+        );
     }
 
     #[test]
