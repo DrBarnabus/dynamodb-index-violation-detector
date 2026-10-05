@@ -162,6 +162,44 @@ pub struct GsiEntry {
     pub check_missing: bool,
 }
 
+impl GsiEntry {
+    /// Check the rules serde cannot express for one entry: a non-empty name not
+    /// already in `taken`, and the hypothetical-vs-existing key-schema invariant.
+    pub fn validate<'a>(
+        &self,
+        taken: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ConfigError> {
+        validate_index_name(&self.name, taken, ConfigError::DuplicateGsi)?;
+
+        if self.hypothetical && self.pk.is_none() {
+            return Err(ConfigError::HypotheticalMissingPk(self.name.clone()));
+        }
+
+        if !self.hypothetical && (self.pk.is_some() || self.sk.is_some()) {
+            return Err(ConfigError::ExistingGsiHasKeySpec(self.name.clone()));
+        }
+
+        Ok(())
+    }
+}
+
+/// Reject an empty index name, or one already in `taken`.
+fn validate_index_name<'a>(
+    name: &str,
+    taken: impl IntoIterator<Item = &'a str>,
+    duplicate: fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    if name.trim().is_empty() {
+        return Err(ConfigError::EmptyIndexName);
+    }
+
+    if taken.into_iter().any(|existing| existing == name) {
+        return Err(duplicate(name.to_string()));
+    }
+
+    Ok(())
+}
+
 /// A `[[lsi]]` entry. Only the missing-sort-key check is
 /// configurable; the sort key schema is discovered via `DescribeTable`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -293,38 +331,13 @@ impl ConfigFile {
             return Err(ConfigError::ZeroSegments);
         }
 
-        let mut gsi_names = Vec::with_capacity(self.gsi.len());
-        for gsi in &self.gsi {
-            if gsi.name.trim().is_empty() {
-                return Err(ConfigError::EmptyIndexName);
-            }
-
-            if gsi_names.contains(&gsi.name) {
-                return Err(ConfigError::DuplicateGsi(gsi.name.clone()));
-            }
-
-            if gsi.hypothetical && gsi.pk.is_none() {
-                return Err(ConfigError::HypotheticalMissingPk(gsi.name.clone()));
-            }
-
-            if !gsi.hypothetical && (gsi.pk.is_some() || gsi.sk.is_some()) {
-                return Err(ConfigError::ExistingGsiHasKeySpec(gsi.name.clone()));
-            }
-
-            gsi_names.push(gsi.name.clone());
+        for (i, gsi) in self.gsi.iter().enumerate() {
+            gsi.validate(self.gsi[..i].iter().map(|g| g.name.as_str()))?;
         }
 
-        let mut lsi_names = Vec::with_capacity(self.lsi.len());
-        for lsi in &self.lsi {
-            if lsi.name.trim().is_empty() {
-                return Err(ConfigError::EmptyIndexName);
-            }
-
-            if lsi_names.contains(&lsi.name) {
-                return Err(ConfigError::DuplicateLsi(lsi.name.clone()));
-            }
-
-            lsi_names.push(lsi.name.clone());
+        for (i, lsi) in self.lsi.iter().enumerate() {
+            let taken = self.lsi[..i].iter().map(|l| l.name.as_str());
+            validate_index_name(&lsi.name, taken, ConfigError::DuplicateLsi)?;
         }
 
         Ok(())

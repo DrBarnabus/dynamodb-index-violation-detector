@@ -10,6 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use super::hint_line;
 use super::picker::FuzzyList;
 use crate::profiles::Profile;
 
@@ -80,17 +81,11 @@ impl ProfilePicker {
             format!("  {:<width$}  {region}", profile.name)
         });
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  no profile matches the filter",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(hint_line("  no profile matches the filter"));
         }
         frame.render_widget(Paragraph::new(lines), list_area);
 
-        let hint = Line::from(Span::styled(
-            "type to filter · ↑/↓ move · enter choose · esc quit",
-            Style::default().fg(Color::DarkGray),
-        ));
+        let hint = hint_line("type to filter · ↑/↓ move · enter choose · esc quit");
         frame.render_widget(Paragraph::new(hint), hint_area);
     }
 }

@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use super::{ALL_CATEGORIES, category_label, target_label};
+use super::{ALL_CATEGORIES, category_label, focus_style, target_label};
 use crate::rules::Violation;
 use crate::state::StateSnapshot;
 
@@ -140,7 +140,7 @@ impl CompletedScreen {
         let list = List::new(items)
             .block(block)
             .highlight_symbol("▶ ")
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            .highlight_style(focus_style(true));
 
         let mut state = ListState::default();
         state.select(Some(

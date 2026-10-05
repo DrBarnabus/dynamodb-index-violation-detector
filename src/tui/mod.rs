@@ -22,6 +22,8 @@ pub use profile_picker::ProfilePicker;
 pub use setup::SetupScreen;
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use crate::rules::{Target, ViolationCategory};
 
@@ -34,6 +36,44 @@ pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+/// The highlight style for the focused control or list row.
+fn focus_style(is_focused: bool) -> Style {
+    if is_focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    }
+}
+
+fn focusable_line(content: String, is_focused: bool) -> Line<'static> {
+    Line::from(Span::styled(content, focus_style(is_focused)))
+}
+
+fn hint_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// A `label: value` text field, showing `placeholder` while empty and a block
+/// cursor while focused.
+fn text_field_line(label: &str, value: &str, placeholder: &str, is_focused: bool) -> Line<'static> {
+    let shown = if value.is_empty() { placeholder } else { value };
+    let cursor = if is_focused { "█" } else { "" };
+    focusable_line(format!("  {label}: {shown}{cursor}"), is_focused)
+}
+
+fn button_line(label: &str, is_focused: bool) -> Line<'static> {
+    focusable_line(format!("  [ {label} ]"), is_focused)
+}
+
+/// `value` with surrounding whitespace removed, or `None` when nothing is left.
+fn trimmed_opt(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The rendered cells of a test terminal as text, one line per row.

@@ -4,8 +4,7 @@
 //! Matching is a case-insensitive subsequence test, ranked so contiguous runs
 //! and matches near the start of a candidate sort first.
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 
 /// A candidate list narrowed by a typed query, with one highlighted match.
 #[derive(Debug, Clone, Default)]
@@ -96,12 +95,7 @@ impl FuzzyList {
             .skip(start)
             .take(limit)
             .map(|(position, &index)| {
-                let style = if position == self.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(label(index), style))
+                super::focusable_line(label(index), position == self.selected)
             })
             .collect()
     }

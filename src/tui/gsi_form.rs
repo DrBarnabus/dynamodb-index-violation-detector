@@ -1,17 +1,18 @@
 //! Hypothetical GSI add-form, raised as a modal over the setup screen.
 //!
 //! Collects a name, a partition key attribute and type, and an optional sort
-//! key attribute and type, then validates them into a [`GsiEntry`] under the
-//! same rules the config loader applies to a TOML `[[gsi]]` entry.
+//! key attribute and type, then validates them into a [`GsiEntry`] with the
+//! config loader's own [`GsiEntry::validate`].
 
 use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::centered;
-use crate::config::GsiEntry;
+use super::{button_line, centered, focusable_line, hint_line, text_field_line, trimmed_opt};
+use crate::config::{ConfigError, GsiEntry};
 use crate::domain::{KeySchemaElement, TypeCode};
 
 const FORM_WIDTH: u16 = 60;
@@ -36,6 +37,13 @@ const FIELDS: [Field; 6] = [
     Field::SkType,
     Field::Add,
 ];
+
+/// What a keypress asks of the screen hosting the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FormAction {
+    Cancel,
+    Submit,
+}
 
 /// The editable state of the add-form, including the last validation failure.
 #[derive(Debug, Clone)]
@@ -62,28 +70,44 @@ impl GsiForm {
         }
     }
 
-    pub(super) fn focus_next(&mut self) {
+    /// Apply a keypress to the form, returning the action it asks of the host.
+    pub(super) fn handle_key(&mut self, key: KeyEvent) -> Option<FormAction> {
+        match key.code {
+            KeyCode::Esc => return Some(FormAction::Cancel),
+            KeyCode::Enter if self.focused() == Field::Add => return Some(FormAction::Submit),
+            KeyCode::Tab | KeyCode::Down | KeyCode::Enter => self.focus_next(),
+            KeyCode::BackTab | KeyCode::Up => self.focus_prev(),
+            KeyCode::Char(' ') if self.is_type_focused() => self.cycle_type(true),
+            KeyCode::Right => self.cycle_type(true),
+            KeyCode::Left => self.cycle_type(false),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Char(c) => self.input_char(c),
+            _ => {}
+        }
+
+        None
+    }
+
+    fn focused(&self) -> Field {
+        FIELDS[self.focus]
+    }
+
+    fn focus_next(&mut self) {
         self.focus = (self.focus + 1) % FIELDS.len();
     }
 
-    pub(super) fn focus_prev(&mut self) {
+    fn focus_prev(&mut self) {
         self.focus = (self.focus + FIELDS.len() - 1) % FIELDS.len();
     }
 
-    pub(super) fn is_add_focused(&self) -> bool {
-        FIELDS[self.focus] == Field::Add
-    }
-
-    /// True when a key-type selector is focused, so the event loop routes
-    /// space and arrows to cycling the type rather than editing text.
-    pub(super) fn is_type_focused(&self) -> bool {
-        matches!(FIELDS[self.focus], Field::PkType | Field::SkType)
+    fn is_type_focused(&self) -> bool {
+        matches!(self.focused(), Field::PkType | Field::SkType)
     }
 
     /// Step the focused key type through S → N → B, or back when `forward` is
     /// false. No-op off the type selectors.
-    pub(super) fn cycle_type(&mut self, forward: bool) {
-        let type_code = match FIELDS[self.focus] {
+    fn cycle_type(&mut self, forward: bool) {
+        let type_code = match self.focused() {
             Field::PkType => &mut self.pk_type,
             Field::SkType => &mut self.sk_type,
             _ => return,
@@ -95,20 +119,20 @@ impl GsiForm {
         };
     }
 
-    pub(super) fn input_char(&mut self, c: char) {
+    fn input_char(&mut self, c: char) {
         if let Some(field) = self.focused_text() {
             field.push(c);
         }
     }
 
-    pub(super) fn backspace(&mut self) {
+    fn backspace(&mut self) {
         if let Some(field) = self.focused_text() {
             field.pop();
         }
     }
 
     fn focused_text(&mut self) -> Option<&mut String> {
-        match FIELDS[self.focus] {
+        match self.focused() {
             Field::Name => Some(&mut self.name),
             Field::PkName => Some(&mut self.pk_name),
             Field::SkName => Some(&mut self.sk_name),
@@ -123,66 +147,36 @@ impl GsiForm {
         &mut self,
         taken: impl IntoIterator<Item = &'a str>,
     ) -> Option<GsiEntry> {
-        match self.validate(taken) {
-            Ok(entry) => Some(entry),
-            Err(message) => {
-                self.error = Some(message);
+        let key = |name: &str, type_code| {
+            trimmed_opt(name).map(|name| KeySchemaElement { name, type_code })
+        };
+        let entry = GsiEntry {
+            name: self.name.trim().to_string(),
+            hypothetical: true,
+            pk: key(&self.pk_name, self.pk_type),
+            sk: key(&self.sk_name, self.sk_type),
+            check_missing: false,
+        };
+
+        match entry.validate(taken) {
+            Ok(()) => Some(entry),
+            Err(err) => {
+                self.error = Some(describe(&err));
                 None
             }
         }
-    }
-
-    fn validate<'a>(&self, taken: impl IntoIterator<Item = &'a str>) -> Result<GsiEntry, String> {
-        let name = self.name.trim();
-        if name.is_empty() {
-            return Err("Index name is required.".to_string());
-        }
-
-        if taken.into_iter().any(|existing| existing == name) {
-            return Err(format!(
-                "A GSI named `{name}` already exists; choose a unique name."
-            ));
-        }
-
-        let pk_name = self.pk_name.trim();
-        if pk_name.is_empty() {
-            return Err("Partition key attribute is required.".to_string());
-        }
-
-        let sk_name = self.sk_name.trim();
-        let sk = (!sk_name.is_empty()).then(|| KeySchemaElement {
-            name: sk_name.to_string(),
-            type_code: self.sk_type,
-        });
-
-        Ok(GsiEntry {
-            name: name.to_string(),
-            hypothetical: true,
-            pk: Some(KeySchemaElement {
-                name: pk_name.to_string(),
-                type_code: self.pk_type,
-            }),
-            sk,
-            check_missing: false,
-        })
     }
 
     pub(super) fn render(&self, frame: &mut Frame, area: Rect) {
         let modal = centered(area, FORM_WIDTH, FORM_HEIGHT);
         frame.render_widget(Clear, modal);
 
-        let focused = FIELDS[self.focus];
+        let focused = self.focused();
         let text = |field: Field, label: &str, value: &str, placeholder: &str| {
-            let is_focused = field == focused;
-            let shown = if value.is_empty() { placeholder } else { value };
-            let cursor = if is_focused { "█" } else { "" };
-            focusable(format!("  {label:<14}{shown}{cursor}"), is_focused)
+            text_field_line(label, value, placeholder, field == focused)
         };
         let selector = |field: Field, type_code: TypeCode| {
-            focusable(
-                format!("  {:<14}◂ {type_code:?} ▸", "  type"),
-                field == focused,
-            )
+            focusable_line(format!("    type: ◂ {type_code:?} ▸"), field == focused)
         };
 
         let mut lines = vec![
@@ -192,7 +186,7 @@ impl GsiForm {
             text(Field::SkName, "Sort key", &self.sk_name, "(none)"),
             selector(Field::SkType, self.sk_type),
             Line::from(""),
-            focusable("  [ Add index ]".to_string(), focused == Field::Add),
+            button_line("Add index", focused == Field::Add),
             Line::from(""),
         ];
         if let Some(error) = &self.error {
@@ -201,10 +195,9 @@ impl GsiForm {
                 Style::default().fg(Color::Red),
             )));
         }
-        lines.push(Line::from(Span::styled(
+        lines.push(hint_line(
             "  space/←/→ change type · enter next / add · esc cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
+        ));
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -220,13 +213,17 @@ impl GsiForm {
     }
 }
 
-fn focusable(content: String, is_focused: bool) -> Line<'static> {
-    let style = if is_focused {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-    };
-    Line::from(Span::styled(content, style))
+/// Form wording for a validation failure; the config loader's own messages
+/// speak in TOML terms.
+fn describe(err: &ConfigError) -> String {
+    match err {
+        ConfigError::EmptyIndexName => "Index name is required.".to_string(),
+        ConfigError::DuplicateGsi(name) => {
+            format!("A GSI named `{name}` already exists; choose a unique name.")
+        }
+        ConfigError::HypotheticalMissingPk(_) => "Partition key attribute is required.".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +324,7 @@ mod tests {
     fn typing_on_selectors_and_the_add_button_is_ignored() {
         let mut form = GsiForm::new();
         form.focus_prev();
-        assert!(form.is_add_focused());
+        assert_eq!(form.focused(), Field::Add);
         form.input_char('x');
         form.backspace();
         form.focus_next();
@@ -335,6 +332,35 @@ mod tests {
 
         assert_eq!(form.name, "");
         assert_eq!(form.pk_name, "");
+    }
+
+    #[test]
+    fn handle_key_routes_editing_and_reports_cancel_and_submit() {
+        use ratatui::crossterm::event::KeyModifiers;
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut form = GsiForm::new();
+        assert_eq!(form.handle_key(press(KeyCode::Char('a'))), None);
+        assert_eq!(form.handle_key(press(KeyCode::Char(' '))), None);
+        assert_eq!(form.name, "a ");
+
+        form.handle_key(press(KeyCode::Enter));
+        form.handle_key(press(KeyCode::Enter));
+        form.handle_key(press(KeyCode::Char(' ')));
+        form.handle_key(press(KeyCode::Right));
+        assert_eq!(form.pk_type, TypeCode::B);
+
+        form.handle_key(press(KeyCode::BackTab));
+        form.handle_key(press(KeyCode::Up));
+        form.handle_key(press(KeyCode::Up));
+        assert_eq!(
+            form.handle_key(press(KeyCode::Enter)),
+            Some(FormAction::Submit)
+        );
+        assert_eq!(
+            form.handle_key(press(KeyCode::Esc)),
+            Some(FormAction::Cancel)
+        );
     }
 
     #[test]

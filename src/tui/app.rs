@@ -174,15 +174,16 @@ fn handle_setup(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
 }
 
 fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
-    if setup.gsi_form_mut().is_some() {
-        handle_gsi_form(setup, key);
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return (key.code == KeyCode::Char('s')).then_some(Command::SaveConfig);
+    }
+
+    if setup.handle_gsi_form_key(key) {
         return None;
     }
 
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => return Some(Command::Quit),
-        KeyCode::Char('s') if ctrl => return Some(Command::SaveConfig),
         KeyCode::Down if setup.is_table_list_active() => setup.table_list_next(),
         KeyCode::Up if setup.is_table_list_active() => setup.table_list_prev(),
         KeyCode::Tab | KeyCode::Down => setup.focus_next(),
@@ -203,33 +204,13 @@ fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
 
             setup.focus_next();
         }
-        KeyCode::Backspace | KeyCode::Delete if !setup.focus_is_text() => {
-            setup.remove_focused_gsi();
-        }
-        KeyCode::Backspace => setup.backspace(),
+        KeyCode::Backspace | KeyCode::Delete => setup.backspace(),
         KeyCode::Char(' ') if !setup.focus_is_text() => setup.toggle(),
         KeyCode::Char(c) => setup.input_char(c),
         _ => {}
     }
 
     None
-}
-
-fn handle_gsi_form(setup: &mut SetupScreen, key: KeyEvent) {
-    let Some(form) = setup.gsi_form_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Esc => setup.close_gsi_form(),
-        KeyCode::Enter if form.is_add_focused() => setup.submit_gsi_form(),
-        KeyCode::Tab | KeyCode::Down | KeyCode::Enter => form.focus_next(),
-        KeyCode::BackTab | KeyCode::Up => form.focus_prev(),
-        KeyCode::Char(' ') | KeyCode::Right if form.is_type_focused() => form.cycle_type(true),
-        KeyCode::Left if form.is_type_focused() => form.cycle_type(false),
-        KeyCode::Backspace => form.backspace(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => form.input_char(c),
-        _ => {}
-    }
 }
 
 fn handle_inflight(inflight: &mut InFlightScreen, key: KeyEvent) -> Option<Command> {
@@ -266,9 +247,6 @@ fn handle_completed(completed: &mut CompletedScreen, key: KeyEvent) -> Option<Co
 }
 
 fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let modal = centered(area, 50, 13);
-    frame.render_widget(Clear, modal);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Keybindings ")
@@ -294,6 +272,8 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
         bind("?", "close this help"),
     ];
 
+    let modal = centered(area, 50, lines.len() as u16 + 2);
+    frame.render_widget(Clear, modal);
     frame.render_widget(Paragraph::new(lines).block(block), modal);
 }
 
@@ -483,7 +463,10 @@ mod tests {
         type_text(&mut app, "email");
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(app.handle_key(ctrl(KeyCode::Char('s'))), None);
+        assert_eq!(
+            app.handle_key(ctrl(KeyCode::Char('s'))),
+            Some(Command::SaveConfig)
+        );
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));

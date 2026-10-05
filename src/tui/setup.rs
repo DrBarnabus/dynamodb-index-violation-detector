@@ -18,6 +18,7 @@
 //! [`SetupScreen::to_scan_config`].
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -27,8 +28,9 @@ use crate::aws::TableDescription;
 use crate::config::{ExportConfig, GsiEntry, LsiEntry, ScanConfig, TtlSettings};
 use crate::domain::KeySchemaElement;
 
-use super::gsi_form::GsiForm;
+use super::gsi_form::{FormAction, GsiForm};
 use super::picker::FuzzyList;
+use super::{button_line, focusable_line, hint_line, text_field_line, trimmed_opt};
 
 /// The largest legal `rate_limit_percent` value.
 const MAX_RATE_LIMIT_PERCENT: u8 = 100;
@@ -289,19 +291,25 @@ impl SetupScreen {
         self.gsi_form = Some(GsiForm::new());
     }
 
-    pub fn close_gsi_form(&mut self) {
-        self.gsi_form = None;
+    /// Route a keypress to the add-form while it is raised, closing it on
+    /// cancel and adding its index on a valid submit. False when no form is
+    /// open, leaving the key to the screen.
+    pub fn handle_gsi_form_key(&mut self, key: KeyEvent) -> bool {
+        let Some(form) = &mut self.gsi_form else {
+            return false;
+        };
+        match form.handle_key(key) {
+            Some(FormAction::Cancel) => self.gsi_form = None,
+            Some(FormAction::Submit) => self.submit_gsi_form(),
+            None => {}
+        }
+
+        true
     }
 
-    /// The open add-form, which takes all key input while raised.
-    pub(super) fn gsi_form_mut(&mut self) -> Option<&mut GsiForm> {
-        self.gsi_form.as_mut()
-    }
-
-    /// Validate the open add-form and, when valid, append its index as a
-    /// focused hypothetical row and close the form. An invalid form stays open
-    /// showing why.
-    pub fn submit_gsi_form(&mut self) {
+    /// Append the open add-form's index as a focused hypothetical row and close
+    /// the form. An invalid form stays open showing why.
+    fn submit_gsi_form(&mut self) {
         let Some(form) = &mut self.gsi_form else {
             return;
         };
@@ -316,11 +324,8 @@ impl SetupScreen {
         self.rebuild_order(Some(Focus::Gsi(self.gsis.len() - 1)));
     }
 
-    /// Remove the focused GSI when it is hypothetical; discovered indexes stay.
-    pub fn remove_focused_gsi(&mut self) {
-        let Focus::Gsi(i) = self.order[self.focus] else {
-            return;
-        };
+    /// Remove the hypothetical GSI at row `i`; discovered indexes stay.
+    fn remove_gsi(&mut self, i: usize) {
         if !self.gsis[i].entry.hypothetical {
             return;
         }
@@ -378,9 +383,11 @@ impl SetupScreen {
         }
     }
 
-    /// Delete the last character of the focused text field.
+    /// Delete the last character of the focused text field, or remove the
+    /// focused hypothetical GSI.
     pub fn backspace(&mut self) {
         let field = match self.order[self.focus] {
+            Focus::Gsi(i) => return self.remove_gsi(i),
             Focus::Table => return self.table.backspace(),
             Focus::Region => &mut self.region,
             Focus::Segments => &mut self.segments,
@@ -469,12 +476,7 @@ impl SetupScreen {
         let mut b = LineBuilder::new(self.order.get(self.focus).copied());
 
         b.header("AWS");
-        b.text_field(
-            Focus::Table,
-            "Table",
-            self.table.query(),
-            Some("type to filter"),
-        );
+        b.text_field(Focus::Table, "Table", self.table.query(), "type to filter");
         if self.is_table_focused() && self.table.has_items() {
             let matches = self
                 .table
@@ -491,28 +493,23 @@ impl SetupScreen {
             Focus::Region,
             "Region override",
             &self.region,
-            Some("(profile default)"),
+            "(profile default)",
         );
 
         b.header("Scan");
-        b.text_field(Focus::Segments, "Segments", &self.segments, None);
+        b.text_field(Focus::Segments, "Segments", &self.segments, "");
         b.text_field(
             Focus::RateLimit,
             "Rate limit %",
             &self.rate_limit,
-            Some("unlimited"),
+            "unlimited",
         );
 
         b.header("Export");
         b.toggle(Focus::Csv, "CSV", self.csv, 0);
-        b.text_field(Focus::CsvPath, "  path", &self.csv_path, Some("(default)"));
+        b.text_field(Focus::CsvPath, "  path", &self.csv_path, "(default)");
         b.toggle(Focus::Ndjson, "NDJSON", self.ndjson, 0);
-        b.text_field(
-            Focus::NdjsonPath,
-            "  path",
-            &self.ndjson_path,
-            Some("(default)"),
-        );
+        b.text_field(Focus::NdjsonPath, "  path", &self.ndjson_path, "(default)");
 
         if let Some(ttl) = &self.ttl {
             b.header(&format!("TTL  (attribute `{}`)", ttl.attribute));
@@ -595,49 +592,42 @@ impl LineBuilder {
     }
 
     fn hint(&mut self, text: &str) {
-        self.lines.push(Line::from(Span::styled(
-            text.to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
+        self.lines.push(hint_line(text));
     }
 
-    fn text_field(&mut self, focus: Focus, label: &str, value: &str, placeholder: Option<&str>) {
-        let is_focused = self.focused == Some(focus);
-        let shown = if value.is_empty() {
-            placeholder.unwrap_or("").to_string()
-        } else {
-            value.to_string()
-        };
-        let cursor = if is_focused { "█" } else { "" };
-        let content = format!("  {label}: {shown}{cursor}");
-        self.push_focusable(content, is_focused);
+    fn text_field(&mut self, focus: Focus, label: &str, value: &str, placeholder: &str) {
+        let is_focused = self.is_focused(focus);
+        self.push_focusable(
+            text_field_line(label, value, placeholder, is_focused),
+            is_focused,
+        );
     }
 
     fn toggle(&mut self, focus: Focus, label: &str, on: bool, indent: usize) {
-        let is_focused = self.focused == Some(focus);
+        let is_focused = self.is_focused(focus);
         let box_ = if on { "[x]" } else { "[ ]" };
         let pad = "  ".repeat(indent + 1);
-        let content = format!("{pad}{box_} {label}");
-        self.push_focusable(content, is_focused);
+        self.push_focusable(
+            focusable_line(format!("{pad}{box_} {label}"), is_focused),
+            is_focused,
+        );
     }
 
     fn button(&mut self, focus: Focus, label: &str) {
-        let is_focused = self.focused == Some(focus);
-        let content = format!("  [ {label} ]");
-        self.push_focusable(content, is_focused);
+        let is_focused = self.is_focused(focus);
+        self.push_focusable(button_line(label, is_focused), is_focused);
     }
 
-    fn push_focusable(&mut self, content: String, is_focused: bool) {
+    fn is_focused(&self, focus: Focus) -> bool {
+        self.focused == Some(focus)
+    }
+
+    fn push_focusable(&mut self, line: Line<'static>, is_focused: bool) {
         if is_focused {
             self.focused_line = self.lines.len();
         }
 
-        let style = if is_focused {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        self.lines.push(Line::from(Span::styled(content, style)));
+        self.lines.push(line);
     }
 }
 
@@ -770,15 +760,6 @@ fn path_to_string(path: &Option<std::path::PathBuf>) -> String {
         .unwrap_or_default()
 }
 
-fn trimmed_opt(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +767,7 @@ mod tests {
     use crate::domain::TypeCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(name: &str, type_code: TypeCode) -> KeySchemaElement {
         KeySchemaElement {
@@ -1234,11 +1216,15 @@ mod tests {
     fn submit_form(screen: &mut SetupScreen, name: &str, pk: &str) {
         focus_on(screen, Focus::AddGsi);
         screen.open_gsi_form();
-        let form = screen.gsi_form_mut().expect("form open");
-        name.chars().for_each(|c| form.input_char(c));
-        form.focus_next();
-        pk.chars().for_each(|c| form.input_char(c));
-        screen.submit_gsi_form();
+        let keys = name
+            .chars()
+            .map(KeyCode::Char)
+            .chain([KeyCode::Tab])
+            .chain(pk.chars().map(KeyCode::Char))
+            .chain([KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
+        for code in keys {
+            screen.handle_gsi_form_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
     }
 
     #[test]
@@ -1269,14 +1255,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_focused_gsi_drops_only_hypothetical_rows() {
+    fn backspace_on_a_gsi_row_removes_only_hypothetical_indexes() {
         let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
         focus_on(&mut screen, Focus::Gsi(0));
-        screen.remove_focused_gsi();
+        screen.backspace();
         assert_eq!(screen.gsis.len(), 2, "discovered index kept");
 
         focus_on(&mut screen, Focus::Gsi(1));
-        screen.remove_focused_gsi();
+        screen.backspace();
         assert_eq!(screen.gsis.len(), 1);
         assert_eq!(screen.order[screen.focus], Focus::AddGsi);
 
