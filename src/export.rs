@@ -5,18 +5,22 @@
 //! cancel contains everything scanned up to that point.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 
+use crate::config::ExportConfig;
 use crate::domain::{AttributeValue, KeyAttribute, TypeCode};
 use crate::rules::{ItemViolations, Target, Violation, ViolationCategory};
 
 /// A failure while serialising or flushing export output.
 #[derive(Debug)]
 pub enum ExportError {
+    Open { path: PathBuf, source: io::Error },
     Io(io::Error),
     Csv(csv::Error),
     Json(serde_json::Error),
@@ -25,6 +29,11 @@ pub enum ExportError {
 impl fmt::Display for ExportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ExportError::Open { path, source } => write!(
+                f,
+                "cannot open export file {}: {source}; check the directory exists and is writable",
+                path.display()
+            ),
             ExportError::Io(e) => write!(f, "export I/O failure: {e}"),
             ExportError::Csv(e) => write!(f, "CSV serialisation failure: {e}"),
             ExportError::Json(e) => write!(f, "NDJSON serialisation failure: {e}"),
@@ -35,6 +44,7 @@ impl fmt::Display for ExportError {
 impl std::error::Error for ExportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            ExportError::Open { source, .. } => Some(source),
             ExportError::Io(e) => Some(e),
             ExportError::Csv(e) => Some(e),
             ExportError::Json(e) => Some(e),
@@ -357,6 +367,43 @@ fn non_scalar_type_code(value: &AttributeValue) -> &'static str {
         AttributeValue::Bs(_) => "BS",
         AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_) => unreachable!(),
     }
+}
+
+/// Open a writer over every enabled export format. Paths must already be
+/// resolved by [`crate::config::resolve_export_paths`]; the opened paths are
+/// returned so the completed screen can show where results landed.
+pub fn open_writers(
+    export: &ExportConfig,
+) -> Result<(Box<dyn ExportWriter>, Vec<PathBuf>), ExportError> {
+    let mut writers: Vec<Box<dyn ExportWriter>> = Vec::new();
+    let mut paths = Vec::new();
+
+    if export.csv
+        && let Some(path) = &export.csv_path
+    {
+        let file = create_file(path)?;
+        writers.push(Box::new(CsvWriter::new(file)?));
+        paths.push(path.clone());
+    }
+
+    if export.ndjson
+        && let Some(path) = &export.ndjson_path
+    {
+        let file = create_file(path)?;
+        writers.push(Box::new(NdjsonWriter::new(file)));
+        paths.push(path.clone());
+    }
+
+    Ok((Box::new(FanOutWriter::new(writers)), paths))
+}
+
+fn create_file(path: &Path) -> Result<BufWriter<File>, ExportError> {
+    File::create(path)
+        .map(BufWriter::new)
+        .map_err(|source| ExportError::Open {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 #[cfg(test)]

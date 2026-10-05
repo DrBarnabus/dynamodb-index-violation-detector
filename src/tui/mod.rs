@@ -7,16 +7,14 @@
 
 mod app;
 mod completed;
+mod error_modal;
 mod inflight;
 mod setup;
 
-#[allow(unused_imports)]
 pub use app::{App, Command};
-#[allow(unused_imports)]
 pub use completed::CompletedScreen;
-#[allow(unused_imports)]
+pub use error_modal::ErrorModal;
 pub use inflight::InFlightScreen;
-#[allow(unused_imports)]
 pub use setup::SetupScreen;
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
