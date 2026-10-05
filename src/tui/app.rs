@@ -25,6 +25,8 @@ use crate::state::StateSnapshot;
 pub enum Command {
     SelectProfile(Profile),
     SelectTable(String),
+    /// Reconnect in another region; `None` means the profile's default.
+    ChangeRegion(Option<String>),
     StartScan,
     CancelScan,
     SaveConfig,
@@ -168,6 +170,10 @@ fn handle_profile_picker(picker: &mut ProfilePicker, key: KeyEvent) -> Option<Co
 }
 
 fn handle_setup(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
+    handle_setup_key(setup, key).or_else(|| setup.take_region_change().map(Command::ChangeRegion))
+}
+
+fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => return Some(Command::Quit),
@@ -413,6 +419,18 @@ mod tests {
         app.handle_key(key(KeyCode::Char('z')));
         app.handle_key(key(KeyCode::Down));
         assert!(!app.setup().unwrap().is_table_focused());
+    }
+
+    #[test]
+    fn setup_leaving_an_edited_region_requests_a_reconnect() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Tab)),
+            Some(Command::ChangeRegion(Some("x".to_string())))
+        );
+        assert_eq!(app.handle_key(key(KeyCode::BackTab)), None);
     }
 
     #[test]

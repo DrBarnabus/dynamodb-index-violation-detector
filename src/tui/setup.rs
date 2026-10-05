@@ -8,7 +8,9 @@
 //!
 //! The table field filters the `ListTables` result as the user types; choosing
 //! a table hands its name to the shell, which describes it and calls
-//! [`SetupScreen::load_table`] to rebuild the index and TTL rows.
+//! [`SetupScreen::load_table`] to rebuild the index and TTL rows. An edited
+//! region is handed over when focus leaves its field, so the shell can
+//! reconnect and refresh the table list and loaded schema.
 //!
 //! The screen holds the form state and exposes primitive mutations — navigate,
 //! toggle, edit — that the event loop drives from key events. On
@@ -98,6 +100,7 @@ pub struct SetupScreen {
     table: FuzzyList,
     loaded_table: Option<String>,
     region: String,
+    connected_region: Option<String>,
     segments: String,
     rate_limit: String,
     csv: bool,
@@ -132,6 +135,7 @@ impl SetupScreen {
             table: FuzzyList::new(tables, &config.table),
             loaded_table: None,
             region: config.region.clone().unwrap_or_default(),
+            connected_region: config.region.clone(),
             segments: config.segments.to_string(),
             rate_limit: config
                 .rate_limit_percent
@@ -156,6 +160,35 @@ impl SetupScreen {
     pub fn load_table(&mut self, description: &TableDescription) {
         self.table.set_query(&description.name);
         self.rebuild_rows(Some(description));
+    }
+
+    /// Clear the discovered rows when the loaded table is unavailable, e.g. it
+    /// does not exist in a newly selected region.
+    pub fn unload_table(&mut self) {
+        self.rebuild_rows(None);
+    }
+
+    /// The table whose schema the index rows reflect, if any.
+    pub fn loaded_table(&self) -> Option<&str> {
+        self.loaded_table.as_deref()
+    }
+
+    /// Replace the tables offered by the picker, keeping what has been typed.
+    pub fn set_tables(&mut self, tables: Vec<String>) {
+        self.table.set_items(tables);
+    }
+
+    /// The region to reconnect to once focus has left an edited region field;
+    /// the inner `None` means the profile's default region. Marks the change as
+    /// handed over, so each edit is reported once.
+    pub fn take_region_change(&mut self) -> Option<Option<String>> {
+        let region = trimmed_opt(&self.region);
+        if self.order[self.focus] == Focus::Region || region == self.connected_region {
+            return None;
+        }
+
+        self.connected_region = region.clone();
+        Some(region)
     }
 
     fn rebuild_rows(&mut self, description: Option<&TableDescription>) {
@@ -1009,7 +1042,7 @@ mod tests {
     fn without_a_described_table_only_hypothetical_rows_show() {
         let screen = unloaded();
 
-        assert_eq!(screen.loaded_table, None);
+        assert_eq!(screen.loaded_table(), None);
         assert_eq!(screen.gsis.len(), 1);
         assert!(screen.gsis[0].entry.hypothetical);
         assert!(screen.lsis.is_empty());
@@ -1024,7 +1057,7 @@ mod tests {
 
         screen.load_table(&description());
 
-        assert_eq!(screen.loaded_table.as_deref(), Some("users"));
+        assert_eq!(screen.loaded_table(), Some("users"));
         assert_eq!(screen.table.query(), "users");
         assert_eq!(screen.gsis.len(), 2);
         assert!(screen.gsis[0].entry.check_missing, "config intent carried");
@@ -1091,5 +1124,48 @@ mod tests {
         let mut screen = unloaded();
         screen.input_char('z');
         assert!(buffer_text(&screen).contains("no listed table matches"));
+    }
+
+    #[test]
+    fn region_change_is_reported_once_focus_leaves_the_field() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), tables());
+        focus_on(&mut screen, Focus::Region);
+        screen.backspace();
+        screen.input_char('2');
+        assert_eq!(screen.take_region_change(), None, "still editing");
+
+        screen.focus_next();
+        assert_eq!(
+            screen.take_region_change(),
+            Some(Some("eu-west-2".to_string()))
+        );
+        assert_eq!(screen.take_region_change(), None, "reported once");
+    }
+
+    #[test]
+    fn unchanged_or_restored_region_is_not_reported() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), tables());
+        focus_on(&mut screen, Focus::Region);
+        screen.input_char(' ');
+        screen.focus_next();
+        assert_eq!(screen.take_region_change(), None, "whitespace only");
+
+        focus_on(&mut screen, Focus::Region);
+        screen.region.clear();
+        screen.focus_next();
+        assert_eq!(screen.take_region_change(), Some(None), "profile default");
+    }
+
+    #[test]
+    fn unload_table_clears_discovered_rows_and_set_tables_refilters() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        screen.unload_table();
+        assert_eq!(screen.loaded_table(), None);
+        assert!(screen.lsis.is_empty());
+        assert!(screen.ttl.is_none());
+        assert_eq!(screen.gsis.len(), 1, "hypothetical GSI survives");
+
+        screen.set_tables(tables());
+        assert!(screen.is_table_list_active());
     }
 }

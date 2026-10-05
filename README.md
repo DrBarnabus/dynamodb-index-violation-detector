@@ -67,6 +67,8 @@ CLI flags override TOML values, which override built-in defaults.
 Uses the default AWS credential provider chain (environment, shared config, SSO,
 IMDS, container). For SSO, run `aws sso login --profile <name>` before launching.
 Region defaults from the profile or environment and is overridable per scan.
+Editing the region on the setup screen reconnects once you leave the field,
+refreshing the table list and re-describing the chosen table in that region.
 
 Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable`,
 and `dynamodb:ListTables` for the table picker. Without `ListTables`, type the

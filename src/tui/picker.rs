@@ -27,6 +27,12 @@ impl FuzzyList {
         list
     }
 
+    /// Replace the candidates, keeping the current query.
+    pub fn set_items(&mut self, items: Vec<String>) {
+        self.items = items;
+        self.refilter();
+    }
+
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -206,6 +212,14 @@ mod tests {
         assert_eq!(list.selected(), None);
         list.select_next();
         assert_eq!(list.selected(), None);
+    }
+
+    #[test]
+    fn set_items_keeps_the_query() {
+        let mut list = list(&[]);
+        list.set_query("ord");
+        list.set_items(vec!["users".to_string(), "orders".to_string()]);
+        assert_eq!(list.selected(), Some("orders"));
     }
 
     #[test]

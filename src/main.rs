@@ -167,6 +167,9 @@ impl Shell {
                 app.show_setup(setup);
                 *modal = error;
             }
+            Command::ChangeRegion(region) => {
+                *modal = self.change_region(region, app).await;
+            }
             Command::SelectTable(name) => {
                 if let Err(err) = self.select_table(&name, app).await {
                     *modal = Some(err);
@@ -197,6 +200,34 @@ impl Shell {
     /// the configured table, if any. A failure is returned as a modal over the
     /// setup screen, which still opens so the user can type a table or quit.
     async fn open_setup(&mut self) -> (SetupScreen, Option<ErrorModal>) {
+        let table = self.config.table.clone();
+        let (tables, error) = self.connect(&table).await;
+        let setup = SetupScreen::new(&self.config, self.description.as_ref(), tables);
+        (setup, error)
+    }
+
+    /// Reconnect in `region`, then refresh the setup screen's table list and
+    /// re-describe its loaded table there. A table absent from the new region
+    /// leaves the form without discovered rows, and the error explains why.
+    async fn change_region(&mut self, region: Option<String>, app: &mut App) -> Option<ErrorModal> {
+        let setup = app.setup_mut()?;
+        self.config.region = region;
+
+        let table = setup.loaded_table().unwrap_or_default().to_string();
+        let (tables, error) = self.connect(&table).await;
+        setup.set_tables(tables);
+        match &self.description {
+            Some(description) => setup.load_table(description),
+            None => setup.unload_table(),
+        }
+
+        error
+    }
+
+    /// Build the client for the current profile and region, then list tables
+    /// and describe `table` (when non-empty) concurrently. The description
+    /// replaces the stored one; the first failure is returned as a modal.
+    async fn connect(&mut self, table: &str) -> (Vec<String>, Option<ErrorModal>) {
         let client: Arc<dyn DynamoClient> = Arc::new(
             RealDynamoClient::new(
                 self.config.profile.as_deref(),
@@ -206,7 +237,6 @@ impl Shell {
         );
         self.client = Some(Arc::clone(&client));
 
-        let table = &self.config.table;
         let (tables, description) = tokio::join!(client.list_tables(), async {
             if table.is_empty() {
                 Ok(None)
@@ -220,15 +250,12 @@ impl Shell {
             error = Some(ErrorModal::from(err));
             Vec::new()
         });
-        match description {
-            Ok(description) => self.description = description,
-            Err(err) => {
-                error.get_or_insert_with(|| ErrorModal::from(err));
-            }
-        }
+        self.description = description.unwrap_or_else(|err| {
+            error.get_or_insert_with(|| ErrorModal::from(err));
+            None
+        });
 
-        let setup = SetupScreen::new(&self.config, self.description.as_ref(), tables);
-        (setup, error)
+        (tables, error)
     }
 
     /// Describe the table chosen in the setup picker and rebuild the form's
