@@ -215,6 +215,7 @@ mod tests {
             ttl,
             provisioned_rcu: None,
             item_count: 0,
+            table_size_bytes: 0,
         }
     }
 

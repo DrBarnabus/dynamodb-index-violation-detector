@@ -1,7 +1,8 @@
 //! Application shell: the thin wiring that binds every module into a
 //! running program. `main` resolves configuration, then drives the TUI event
 //! loop: once a profile is known it builds the AWS client, lists tables and
-//! describes the chosen one. On *Start scan* it starts a scan `Pipeline` and
+//! describes the chosen one. *Estimate cost* re-describes the table to size the
+//! scan. On *Start scan* it starts a scan `Pipeline` and
 //! feeds its items through it, interleaved with terminal input and redraws.
 //!
 //! No business logic lives here: every decision is delegated to an owning
@@ -22,6 +23,7 @@ use dynamodb_violation_detector::aws::{
     AwsError, DynamoClient, RealDynamoClient, TableDescription,
 };
 use dynamodb_violation_detector::config::{self, CliArgs, ConfigError, ScanConfig};
+use dynamodb_violation_detector::estimate;
 use dynamodb_violation_detector::pipeline::{Pipeline, now_epoch_secs};
 use dynamodb_violation_detector::profiles::{self, Profile, ProfileError};
 use dynamodb_violation_detector::scan::ScannedItem;
@@ -175,6 +177,11 @@ impl Shell {
                     *modal = Some(err);
                 }
             }
+            Command::EstimateCost => {
+                if let Err(err) = self.estimate_cost(app).await {
+                    *modal = Some(err);
+                }
+            }
             Command::StartScan => match self.start_scan(app).await {
                 Ok(pipeline) => {
                     *scan = Some(pipeline);
@@ -270,6 +277,34 @@ impl Shell {
             setup.load_table(&description);
         }
 
+        self.description = Some(description);
+        Ok(())
+    }
+
+    /// Describe the form's table afresh, for an up-to-date size and capacity,
+    /// and show the estimated cost of scanning it with the form's settings.
+    async fn estimate_cost(&mut self, app: &mut App) -> Result<(), ErrorModal> {
+        let setup = app.setup_mut().ok_or_else(|| {
+            ErrorModal::message("Cannot estimate cost", "no setup screen is active")
+        })?;
+        let config = setup
+            .to_scan_config()
+            .map_err(|message| ErrorModal::message("Invalid scan settings", &message))?;
+
+        let client = self.client()?;
+        let description = client
+            .describe_table(&config.table)
+            .await
+            .map_err(ErrorModal::from)?;
+        if setup.loaded_table() != Some(description.name.as_str()) {
+            setup.load_table(&description);
+        }
+
+        setup.show_estimate(estimate::estimate(
+            &description,
+            config.segments,
+            config.rate_limit_percent,
+        ));
         self.description = Some(description);
         Ok(())
     }

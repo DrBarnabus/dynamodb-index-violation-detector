@@ -32,6 +32,8 @@ pub struct TableDescription {
     pub provisioned_rcu: Option<u64>,
     /// Approximate item count, updated by DynamoDB roughly every 6 hours.
     pub item_count: u64,
+    /// Approximate table size in bytes, refreshed on the same cadence.
+    pub table_size_bytes: u64,
 }
 
 /// A table's own primary key schema.
@@ -400,7 +402,7 @@ fn classify_code(code: &str) -> AwsErrorKind {
 /// Maps a raw `DescribeTable` result (plus separately-fetched TTL) into the
 /// crate's [`TableDescription`]: index key schemas resolved to
 /// scalar type codes, provisioned RCU snapshotted (`None` for on-demand) and
-/// the approximate item count for progress estimation.
+/// the approximate item count and size for progress and cost estimation.
 fn map_table_description(
     table: SdkTableDescription,
     ttl: Option<TtlDescription>,
@@ -463,6 +465,7 @@ fn map_table_description(
         ttl,
         provisioned_rcu,
         item_count: table.item_count.unwrap_or(0).max(0) as u64,
+        table_size_bytes: table.table_size_bytes.unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -711,6 +714,7 @@ mod tests {
         SdkTable::builder()
             .table_name("users")
             .item_count(1000)
+            .table_size_bytes(4_096_000)
             .set_attribute_definitions(Some(vec![
                 attr("id", SdkScalar::S),
                 attr("createdAt", SdkScalar::N),
@@ -750,6 +754,7 @@ mod tests {
 
         assert_eq!(mapped.name, "users");
         assert_eq!(mapped.item_count, 1000);
+        assert_eq!(mapped.table_size_bytes, 4_096_000);
         assert_eq!(mapped.provisioned_rcu, Some(120));
         assert_eq!(mapped.ttl, ttl);
 
@@ -824,6 +829,7 @@ mod tests {
             ttl: None,
             provisioned_rcu: Some(100),
             item_count: 42,
+            table_size_bytes: 0,
         }
     }
 

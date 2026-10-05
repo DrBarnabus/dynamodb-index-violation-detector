@@ -25,6 +25,7 @@ use dynamodb_violation_detector::config::{
     self, CliArgs, GsiEntry, LsiEntry, ScanConfig, TtlSettings,
 };
 use dynamodb_violation_detector::domain::{self, Item, TypeCode};
+use dynamodb_violation_detector::estimate::{self, RateBound};
 use dynamodb_violation_detector::pipeline::{Pipeline, now_epoch_secs};
 use dynamodb_violation_detector::state::StateSnapshot;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -619,6 +620,32 @@ fn padded_items(count: usize) -> Vec<HashMap<String, SdkValue>> {
             item
         })
         .collect()
+}
+
+#[tokio::test]
+async fn cost_estimate_sizes_the_scan_from_the_described_table() {
+    let local = LocalDynamo::start().await;
+    local.create_users_table("users", 40).await;
+    local.put_items("users", padded_items(100)).await;
+
+    let description = local.client().describe_table("users").await.unwrap();
+    assert!(
+        description.table_size_bytes >= 100 * 4000,
+        "table size {} should cover the padded items",
+        description.table_size_bytes
+    );
+
+    let estimate = estimate::estimate(&description, 4, Some(50));
+    let expected_rcu = description.table_size_bytes as f64 / 4096.0 / 2.0;
+    assert!((estimate.rcu - expected_rcu).abs() <= 0.5);
+    assert_eq!(estimate.rcu_per_sec, 20.0);
+    assert_eq!(
+        estimate.bound,
+        RateBound::RateLimit {
+            percent: 50,
+            provisioned_rcu: 40
+        }
+    );
 }
 
 #[tokio::test]

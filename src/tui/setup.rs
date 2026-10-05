@@ -4,7 +4,8 @@
 //! editable form: table picker, region override, scan settings, export toggles
 //! and paths, TTL sub-checks, and a per-index `check_missing` toggle for every
 //! GSI/LSI. Hypothetical GSIs, from TOML or the *Add hypothetical GSI* form,
-//! appear tagged alongside the discovered indexes.
+//! appear tagged alongside the discovered indexes. *Estimate cost* shows the
+//! RCU and duration a full scan should take, until a field it depends on changes.
 //!
 //! The table field filters the `ListTables` result as the user types; choosing
 //! a table hands its name to the shell, which describes it and calls
@@ -27,10 +28,11 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::aws::TableDescription;
 use crate::config::{ExportConfig, GsiEntry, LsiEntry, ScanConfig, TtlSettings};
 use crate::domain::KeySchemaElement;
+use crate::estimate::{CostEstimate, RateBound, SEGMENT_RCU_PER_SEC};
 
 use super::gsi_form::{FormAction, GsiForm};
 use super::picker::FuzzyList;
-use super::{button_line, focusable_line, hint_line, text_field_line, trimmed_opt};
+use super::{button_line, fmt_duration, focusable_line, hint_line, text_field_line, trimmed_opt};
 
 /// The largest legal `rate_limit_percent` value.
 const MAX_RATE_LIMIT_PERCENT: u8 = 100;
@@ -64,6 +66,7 @@ enum Focus {
     Gsi(usize),
     AddGsi,
     Lsi(usize),
+    Estimate,
     Start,
 }
 
@@ -117,6 +120,7 @@ pub struct SetupScreen {
     order: Vec<Focus>,
     focus: usize,
     gsi_form: Option<GsiForm>,
+    estimate: Option<CostEstimate>,
 }
 
 impl SetupScreen {
@@ -156,6 +160,7 @@ impl SetupScreen {
             order: Vec::new(),
             focus: 0,
             gsi_form: None,
+            estimate: None,
         };
         screen.rebuild_rows(description);
         screen
@@ -206,6 +211,7 @@ impl SetupScreen {
         self.ttl = build_ttl_row(self.intents.ttl.as_ref(), description);
         self.rebuild_order(focused);
         self.loaded_table = description.map(|d| d.name.clone());
+        self.estimate = None;
     }
 
     /// Fold the rows' current settings into the intents, so edits survive the
@@ -284,6 +290,27 @@ impl SetupScreen {
     /// an `Enter` into a `StartScan` command.
     pub fn is_start_focused(&self) -> bool {
         self.order.get(self.focus) == Some(&Focus::Start)
+    }
+
+    /// True when *Estimate cost* is focused, so the event loop can turn an
+    /// `Enter` into an `EstimateCost` command.
+    pub fn is_estimate_focused(&self) -> bool {
+        self.order[self.focus] == Focus::Estimate
+    }
+
+    /// Show `estimate` beneath *Estimate cost* until an input it depends on is
+    /// edited or the table is reloaded.
+    pub fn show_estimate(&mut self, estimate: CostEstimate) {
+        self.estimate = Some(estimate);
+    }
+
+    fn clear_stale_estimate(&mut self) {
+        if matches!(
+            self.order[self.focus],
+            Focus::Table | Focus::Region | Focus::Segments | Focus::RateLimit
+        ) {
+            self.estimate = None;
+        }
     }
 
     /// True when the focused control is a text field, so the event loop routes
@@ -390,6 +417,7 @@ impl SetupScreen {
     /// Append a character to the focused text field. Numeric fields accept
     /// digits only; toggles and the Start button ignore input.
     pub fn input_char(&mut self, c: char) {
+        self.clear_stale_estimate();
         match self.order[self.focus] {
             Focus::Table => self.table.push(c),
             Focus::Region => self.region.push(c),
@@ -404,6 +432,7 @@ impl SetupScreen {
     /// Delete the last character of the focused text field, or remove the
     /// focused hypothetical GSI.
     pub fn backspace(&mut self) {
+        self.clear_stale_estimate();
         let field = match self.order[self.focus] {
             Focus::Gsi(i) => return self.remove_gsi(i),
             Focus::Table => return self.table.backspace(),
@@ -558,6 +587,13 @@ impl SetupScreen {
         }
 
         b.blank();
+        b.button(Focus::Estimate, "Estimate cost");
+        if let Some(estimate) = &self.estimate {
+            b.lines.push(Line::from(fmt_estimate(estimate)));
+            b.hint(
+                "    from the approximate table size, which DynamoDB refreshes about every 6 hours",
+            );
+        }
         b.button(Focus::Start, "Start scan");
         b.hint("↑/↓ move · space toggle · type to edit · enter choose / start · esc quit");
         b.hint("del removes a hypothetical GSI");
@@ -758,6 +794,7 @@ fn build_order(ttl: Option<&TtlRow>, gsi_count: usize, lsi_count: usize) -> Vec<
     order.extend((0..gsi_count).map(Focus::Gsi));
     order.push(Focus::AddGsi);
     order.extend((0..lsi_count).map(Focus::Lsi));
+    order.push(Focus::Estimate);
     order.push(Focus::Start);
     order
 }
@@ -770,6 +807,43 @@ fn fmt_key(pk: &KeySchemaElement, sk: Option<&KeySchemaElement>) -> String {
         ),
         None => format!("pk {}({:?})", pk.name, pk.type_code),
     }
+}
+
+fn fmt_estimate(estimate: &CostEstimate) -> String {
+    let bound = match estimate.bound {
+        RateBound::RateLimit {
+            percent,
+            provisioned_rcu,
+        } => format!(
+            "{percent}% of {} provisioned RCU",
+            group_digits(provisioned_rcu)
+        ),
+        RateBound::Provisioned { .. } => "full provisioned capacity, no rate limit".to_string(),
+        RateBound::Segments { segments } => {
+            let per_segment = group_digits(SEGMENT_RCU_PER_SEC as u64);
+            format!("assumed {per_segment} RCU/s per segment × {segments}")
+        }
+    };
+    format!(
+        "    ≈ {} RCU · ~{} at {} RCU/s ({bound})",
+        group_digits(estimate.rcu.ceil() as u64),
+        fmt_duration(estimate.duration),
+        group_digits(estimate.rcu_per_sec.round() as u64),
+    )
+}
+
+/// `n` with comma thousands separators.
+fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+
+    grouped
 }
 
 fn tag(hypothetical: bool) -> &'static str {
@@ -825,6 +899,7 @@ mod tests {
             }),
             provisioned_rcu: Some(100),
             item_count: 42,
+            table_size_bytes: 0,
         }
     }
 
@@ -1340,6 +1415,84 @@ mod tests {
         assert!(!screen.lsis[0].entry.check_missing);
         assert!(!screen.ttl.as_ref().unwrap().checks[0]);
         assert!(screen.gsis[0].entry.check_missing, "untouched intent kept");
+    }
+
+    fn sample_estimate() -> CostEstimate {
+        CostEstimate {
+            rcu: 6000.0,
+            rcu_per_sec: 60.0,
+            duration: std::time::Duration::from_secs(100),
+            bound: RateBound::RateLimit {
+                percent: 60,
+                provisioned_rcu: 100,
+            },
+        }
+    }
+
+    #[test]
+    fn shown_estimate_renders_beneath_its_button() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        focus_on(&mut screen, Focus::Estimate);
+        assert!(screen.is_estimate_focused());
+        assert!(buffer_text(&screen).contains("Estimate cost"));
+
+        screen.show_estimate(sample_estimate());
+        assert!(
+            buffer_text(&screen)
+                .contains("≈ 6,000 RCU · ~1m40s at 60 RCU/s (60% of 100 provisioned RCU)")
+        );
+    }
+
+    #[test]
+    fn estimate_clears_when_an_input_it_depends_on_changes() {
+        let mut screen = SetupScreen::new(&config(), Some(&description()), Vec::new());
+        screen.show_estimate(sample_estimate());
+
+        focus_on(&mut screen, Focus::CsvPath);
+        screen.input_char('x');
+        focus_on(&mut screen, Focus::Csv);
+        screen.toggle();
+        assert!(
+            screen.estimate.is_some(),
+            "export settings do not affect cost"
+        );
+
+        for focus in [
+            Focus::Table,
+            Focus::Region,
+            Focus::Segments,
+            Focus::RateLimit,
+        ] {
+            screen.show_estimate(sample_estimate());
+            focus_on(&mut screen, focus);
+            screen.backspace();
+            assert!(
+                screen.estimate.is_none(),
+                "{focus:?} edit keeps a stale estimate"
+            );
+        }
+
+        screen.show_estimate(sample_estimate());
+        screen.load_table(&description());
+        assert!(screen.estimate.is_none(), "reload keeps a stale estimate");
+    }
+
+    #[test]
+    fn estimate_bounds_render_their_source() {
+        let mut estimate = sample_estimate();
+        estimate.bound = RateBound::Provisioned { rcu: 60 };
+        assert!(fmt_estimate(&estimate).ends_with("(full provisioned capacity, no rate limit)"));
+
+        estimate.bound = RateBound::Segments { segments: 4 };
+        assert!(fmt_estimate(&estimate).ends_with("(assumed 1,280 RCU/s per segment × 4)"));
+    }
+
+    #[test]
+    fn digits_group_in_thousands() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
     }
 
     #[test]

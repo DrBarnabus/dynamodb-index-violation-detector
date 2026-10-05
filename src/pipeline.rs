@@ -315,6 +315,7 @@ mod tests {
             }),
             provisioned_rcu: None,
             item_count: 3,
+            table_size_bytes: 0,
         }
     }
 

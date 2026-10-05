@@ -21,6 +21,8 @@ pub use inflight::InFlightScreen;
 pub use profile_picker::ProfilePicker;
 pub use setup::SetupScreen;
 
+use std::time::Duration;
+
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -68,6 +70,18 @@ fn text_field_line(label: &str, value: &str, placeholder: &str, is_focused: bool
 
 fn button_line(label: &str, is_focused: bool) -> Line<'static> {
     focusable_line(format!("  [ {label} ]"), is_focused)
+}
+
+pub(super) fn fmt_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 /// `value` with surrounding whitespace removed, or `None` when nothing is left.

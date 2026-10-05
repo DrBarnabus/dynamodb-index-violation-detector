@@ -1,8 +1,8 @@
 //! Screen state machine and key dispatch.
 //!
 //! [`App`] owns the current screen and maps key events onto it, returning a
-//! [`Command`] for shell-level actions (choose a profile or table, start/cancel
-//! a scan, save config, quit) while handling navigation, toggles, and editing
+//! [`Command`] for shell-level actions (choose a profile or table, estimate
+//! cost, start/cancel a scan, save config, quit) while handling navigation, toggles, and editing
 //! internally. The flow is linear — Profile picker → Setup → In-flight →
 //! Completed — with no back-navigation from the completed screen; the shell
 //! drives the forward transitions.
@@ -27,6 +27,7 @@ pub enum Command {
     SelectTable(String),
     /// Reconnect in another region; `None` means the profile's default.
     ChangeRegion(Option<String>),
+    EstimateCost,
     StartScan,
     CancelScan,
     SaveConfig,
@@ -197,6 +198,10 @@ fn handle_setup_key(setup: &mut SetupScreen, key: KeyEvent) -> Option<Command> {
                 return setup.choose_table().map(Command::SelectTable);
             }
 
+            if setup.is_estimate_focused() {
+                return Some(Command::EstimateCost);
+            }
+
             if setup.is_add_gsi_focused() {
                 setup.open_gsi_form();
                 return None;
@@ -264,7 +269,7 @@ fn render_help(frame: &mut Frame, area: ratatui::layout::Rect) {
         bind("j/k", "move (completed screen)"),
         bind("Tab", "next field"),
         bind("Space", "toggle"),
-        bind("Enter", "choose / add GSI / start scan"),
+        bind("Enter", "choose / add GSI / estimate / start"),
         bind("Del", "remove hypothetical GSI"),
         bind("Ctrl+S", "save config"),
         bind("Ctrl+C", "cancel scan"),
@@ -329,6 +334,7 @@ mod tests {
             ttl: None,
             provisioned_rcu: None,
             item_count: 10,
+            table_size_bytes: 0,
         }
     }
 
@@ -433,6 +439,18 @@ mod tests {
     }
 
     #[test]
+    fn setup_enter_on_estimate_requests_a_cost_estimate() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        assert!(app.setup().unwrap().is_estimate_focused());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::EstimateCost)
+        );
+    }
+
+    #[test]
     fn setup_leaving_an_edited_region_requests_a_reconnect() {
         let mut app = app();
         app.handle_key(key(KeyCode::Tab));
@@ -453,6 +471,7 @@ mod tests {
     #[test]
     fn setup_adds_and_removes_a_hypothetical_gsi_from_the_keyboard() {
         let mut app = app();
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         assert!(app.setup().unwrap().is_add_gsi_focused());
@@ -499,6 +518,7 @@ mod tests {
     #[test]
     fn setup_esc_closes_the_gsi_form_without_quitting() {
         let mut app = app();
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Enter));

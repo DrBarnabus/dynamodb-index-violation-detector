@@ -6,6 +6,7 @@ pub mod assemble;
 pub mod aws;
 pub mod config;
 pub mod domain;
+pub mod estimate;
 pub mod export;
 pub mod pipeline;
 pub mod profiles;

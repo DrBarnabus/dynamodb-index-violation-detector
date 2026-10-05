@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::{ALL_CATEGORIES, category_label, centered};
+use super::{ALL_CATEGORIES, category_label, centered, fmt_duration};
 use crate::state::StateSnapshot;
 
 /// Width of the inline per-segment progress bars, in cells.
@@ -205,18 +205,6 @@ fn fmt_eta(eta: Option<Duration>) -> String {
     match eta {
         Some(eta) => fmt_duration(eta),
         None => "—".to_string(),
-    }
-}
-
-fn fmt_duration(duration: Duration) -> String {
-    let total = duration.as_secs();
-    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    if h > 0 {
-        format!("{h}h{m:02}m{s:02}s")
-    } else if m > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}s")
     }
 }
 
