@@ -39,9 +39,10 @@ cargo build --release --target x86_64-unknown-linux-musl
 dynamodb-violation-detector [OPTIONS]
 ```
 
-With no arguments the tool opens the AWS profile picker, then the scan setup
-screen. Any of `--config`, `--table`, `--profile`, or `--region` skips the
-picker and pre-fills setup.
+A table is required, from either `--table` or `table` in the config file. The
+tool describes the table before the TUI starts, so a missing table or bad
+credentials are reported on stderr. It then opens the scan setup screen,
+pre-filled from the config file and flags.
 
 | Flag | Description |
 | --- | --- |
@@ -60,24 +61,34 @@ Uses the default AWS credential provider chain (environment, shared config, SSO,
 IMDS, container). For SSO, run `aws sso login --profile <name>` before launching.
 Region defaults from the profile or environment and is overridable per scan.
 
-Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable`,
-`dynamodb:GetItem`, `dynamodb:ListTables`.
+Required IAM permissions (detect-only): `dynamodb:Scan`, `dynamodb:DescribeTable`.
 
 ### Keybindings
 
-- `q` / `Esc` — quit or back
-- `Tab` / `Shift+Tab` — swap the in-flight body view
-- `↑`/`↓` or `j`/`k` — navigate lists
-- `Enter` — drill into selection
-- `y` — copy (yank)
-- `?` — help overlay
-- `Ctrl+C` — cancel a running scan (confirmation required)
+`?` toggles the help overlay on every screen.
+
+Setup screen:
+
+- `Tab` / `↓` and `Shift+Tab` / `↑` — move between fields
+- `Space` — toggle a checkbox
+- `Enter` — next field, or start the scan on *Start scan*
+- `Ctrl+S` — save the form to the config file
+- `Esc` — quit
+
+In-flight screen:
+
+- `Ctrl+C`, `q` or `Esc` — cancel the scan; confirm with `y`, dismiss with `n` / `Esc`
+
+Completed screen:
+
+- `↑`/`↓` or `j`/`k` — move through the violation summary
+- `q` / `Esc` — quit
 
 ## Configuration
 
 Scan setup is captured in a TOML file (default `./scan.toml`, override with
-`--config`). The setup screen can both load from and save to one. A minimal
-example:
+`--config`). It pre-fills the setup screen at launch, and `Ctrl+S` on that
+screen saves the form back to it. A minimal example:
 
 ```toml
 table = "users"
@@ -97,6 +108,11 @@ enabled = true
 [[gsi]]
 name = "GSI1"
 check_missing = false          # true only for non-sparse indexes
+
+[[gsi]]
+name = "ByEmail"
+hypothetical = true            # audit a GSI before creating it
+pk = { name = "email", type = "S" }
 ```
 
 ## Export
