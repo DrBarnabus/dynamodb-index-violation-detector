@@ -106,6 +106,35 @@ pub(super) fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     text
 }
 
+/// A feed entry for an item keyed `id=<pk>` with no sort key.
+#[cfg(test)]
+pub(super) fn recent_violation(
+    pk: &str,
+    target: Target,
+    category: ViolationCategory,
+    attribute: Option<&str>,
+) -> crate::state::RecentViolation {
+    use crate::domain::{AttributeValue, KeyAttribute};
+    use crate::rules::Violation;
+
+    crate::state::RecentViolation {
+        pk: KeyAttribute {
+            name: "id".to_string(),
+            value: AttributeValue::S(pk.to_string()),
+        },
+        sk: None,
+        violation: Violation {
+            target,
+            category,
+            attribute: attribute.map(str::to_string),
+            actual_value: None,
+            actual_type: None,
+            expected_type: None,
+            size_bytes: None,
+        },
+    }
+}
+
 /// Every violation category in a stable display order, shared by the in-flight
 /// and completed screens so their counts panels are deterministic.
 pub(super) const ALL_CATEGORIES: [ViolationCategory; 8] = [

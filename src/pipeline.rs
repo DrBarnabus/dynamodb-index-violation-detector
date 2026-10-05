@@ -141,10 +141,8 @@ impl Pipeline {
             violations,
             self.detected_at,
         );
-        for violation in &group.violations {
-            self.aggregator
-                .record_violation(&group.pk, group.sk.as_ref(), violation);
-        }
+        self.aggregator
+            .record_violations(&group.pk, group.sk.as_ref(), &group.violations);
 
         match &mut self.writer {
             Some(writer) => writer.write(&group),

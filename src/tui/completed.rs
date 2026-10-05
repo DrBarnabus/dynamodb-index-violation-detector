@@ -145,9 +145,9 @@ fn section(title: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AttributeValue, KeyAttribute};
-    use crate::rules::{Target, Violation, ViolationCategory};
+    use crate::rules::{Target, ViolationCategory};
     use crate::state::RecentViolation;
+    use crate::tui::recent_violation;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -158,22 +158,7 @@ mod tests {
         category: ViolationCategory,
         attribute: Option<&str>,
     ) -> RecentViolation {
-        RecentViolation {
-            pk: KeyAttribute {
-                name: "id".to_string(),
-                value: AttributeValue::S("u-1".to_string()),
-            },
-            sk: None,
-            violation: Violation {
-                target,
-                category,
-                attribute: attribute.map(str::to_string),
-                actual_value: None,
-                actual_type: None,
-                expected_type: None,
-                size_bytes: None,
-            },
-        }
+        recent_violation("u-1", target, category, attribute)
     }
 
     fn snapshot(violations: Vec<RecentViolation>) -> StateSnapshot {

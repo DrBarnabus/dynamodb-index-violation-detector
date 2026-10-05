@@ -2,8 +2,6 @@
 //! their violations. The in-flight screen tails the newest entries as they
 //! stream in; the completed screen browses the same list with a cursor.
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -11,7 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::{category_label, focus_style, target_label};
-use crate::domain::{AttributeValue, KeyAttribute};
+use crate::domain::KeyAttribute;
+use crate::export::render_key;
 use crate::state::RecentViolation;
 
 /// How the feed positions itself in the list.
@@ -41,23 +40,26 @@ pub(super) fn render_feed(
         return;
     }
 
-    let items: Vec<ListItem> = violations
-        .iter()
-        .map(|recent| ListItem::new(feed_line(recent)))
-        .collect();
-    let last = violations.len() - 1;
+    let shown = match view {
+        FeedView::Tail => {
+            let rows = block.inner(area).height as usize;
+            &violations[violations.len().saturating_sub(rows)..]
+        }
+        FeedView::Cursor(_) => violations,
+    };
+    let last = shown.len() - 1;
+    let list = List::new(shown.iter().map(|recent| ListItem::new(feed_line(recent)))).block(block);
     let (selected, list) = match view {
-        FeedView::Tail => (last, List::new(items)),
+        FeedView::Tail => (last, list),
         FeedView::Cursor(index) => (
             index.min(last),
-            List::new(items)
-                .highlight_symbol("▶ ")
+            list.highlight_symbol("▶ ")
                 .highlight_style(focus_style(true)),
         ),
     };
 
     let mut state = ListState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(list.block(block), area, &mut state);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn feed_line(recent: &RecentViolation) -> Line<'static> {
@@ -84,44 +86,34 @@ fn feed_line(recent: &RecentViolation) -> Line<'static> {
     Line::from(spans)
 }
 
-/// `name=value` for a key attribute; binary values are base64.
+/// `name=value` for a key attribute, rendered as in the CSV export.
 fn key_text(key: &KeyAttribute) -> String {
-    let value = match &key.value {
-        AttributeValue::S(value) | AttributeValue::N(value) => value.clone(),
-        AttributeValue::B(bytes) => BASE64.encode(bytes),
-        _ => "?".to_string(),
-    };
+    let (value, _) = render_key(key);
     format!("{}={value}", key.name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Target, Violation, ViolationCategory};
+    use crate::domain::AttributeValue;
+    use crate::rules::{Target, ViolationCategory};
+    use crate::tui::recent_violation;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::Borders;
 
     fn recent(pk: &str, sk: Option<AttributeValue>) -> RecentViolation {
-        RecentViolation {
-            pk: KeyAttribute {
-                name: "id".to_string(),
-                value: AttributeValue::S(pk.to_string()),
-            },
-            sk: sk.map(|value| KeyAttribute {
-                name: "ts".to_string(),
-                value,
-            }),
-            violation: Violation {
-                target: Target::Gsi("GSI1".to_string()),
-                category: ViolationCategory::TypeMismatch,
-                attribute: Some("email".to_string()),
-                actual_value: None,
-                actual_type: None,
-                expected_type: None,
-                size_bytes: None,
-            },
-        }
+        let mut recent = recent_violation(
+            pk,
+            Target::Gsi("GSI1".to_string()),
+            ViolationCategory::TypeMismatch,
+            Some("email"),
+        );
+        recent.sk = sk.map(|value| KeyAttribute {
+            name: "ts".to_string(),
+            value,
+        });
+        recent
     }
 
     fn draw(violations: &[RecentViolation], view: FeedView, height: u16) -> String {

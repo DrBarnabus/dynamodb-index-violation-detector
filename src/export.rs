@@ -310,7 +310,7 @@ fn native_value(value: &AttributeValue) -> serde_json::Value {
 }
 
 /// Render a key attribute to its CSV value and type code. Binary is base64.
-fn render_key(key: &KeyAttribute) -> (String, &'static str) {
+pub(crate) fn render_key(key: &KeyAttribute) -> (String, &'static str) {
     match &key.value {
         AttributeValue::S(s) => (s.clone(), "S"),
         AttributeValue::N(n) => (n.clone(), "N"),

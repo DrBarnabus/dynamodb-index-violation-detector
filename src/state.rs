@@ -3,7 +3,7 @@
 //! [`Aggregator`] is the single shared sink every scan worker and the TUI touch.
 //! Segment workers call [`record_item`](Aggregator::record_item) and
 //! [`record_consumed`](Aggregator::record_consumed) concurrently; the consumer
-//! calls [`record_violation`](Aggregator::record_violation); the render loop calls
+//! calls [`record_violations`](Aggregator::record_violations); the render loop calls
 //! [`snapshot`](Aggregator::snapshot) each frame. Counts are atomic; only the
 //! rolling window, per-category tallies and rate history take a short lock.
 //!
@@ -137,26 +137,28 @@ impl Aggregator {
         }
     }
 
-    /// Record one violation of the item keyed by `pk`/`sk`: bump its category
-    /// tally and push it onto the rolling window, evicting the oldest once the
-    /// window is full.
-    pub fn record_violation(
+    /// Record the violations of the item keyed by `pk`/`sk`: bump their category
+    /// tallies and push them onto the rolling window, evicting the oldest once
+    /// the window is full.
+    pub fn record_violations(
         &self,
         pk: &KeyAttribute,
         sk: Option<&KeyAttribute>,
-        violation: &Violation,
+        violations: &[Violation],
     ) {
-        self.total_violations.fetch_add(1, Ordering::Relaxed);
+        self.total_violations
+            .fetch_add(violations.len() as u64, Ordering::Relaxed);
         let mut log = self.log.lock().expect("violation log not poisoned");
-        *log.counts.entry(violation.category).or_insert(0) += 1;
-        log.window.push_back(RecentViolation {
-            pk: pk.clone(),
-            sk: sk.cloned(),
-            violation: violation.clone(),
-        });
-        if log.window.len() > ROLLING_WINDOW_CAP {
-            log.window.pop_front();
+        for violation in violations {
+            *log.counts.entry(violation.category).or_insert(0) += 1;
+            log.window.push_back(RecentViolation {
+                pk: pk.clone(),
+                sk: sk.cloned(),
+                violation: violation.clone(),
+            });
         }
+        let overflow = log.window.len().saturating_sub(ROLLING_WINDOW_CAP);
+        log.window.drain(..overflow);
     }
 
     /// Record read capacity consumed by one page. The `segment` is
@@ -299,7 +301,7 @@ mod tests {
             name: "id".to_string(),
             value: AttributeValue::S("u-1".to_string()),
         };
-        agg.record_violation(&pk, None, &violation(category));
+        agg.record_violations(&pk, None, &[violation(category)]);
     }
 
     #[test]
@@ -369,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_window_carries_the_item_key() {
+    fn rolling_window_keys_each_of_an_items_violations() {
         let agg = Aggregator::new(1, 0, MockClock::new());
         let pk = KeyAttribute {
             name: "id".to_string(),
@@ -379,12 +381,33 @@ mod tests {
             name: "ts".to_string(),
             value: AttributeValue::N("42".to_string()),
         };
-        agg.record_violation(&pk, Some(&sk), &violation(ViolationCategory::TtlMissing));
+        agg.record_violations(
+            &pk,
+            Some(&sk),
+            &[
+                violation(ViolationCategory::TtlMissing),
+                violation(ViolationCategory::TtlMalformed),
+            ],
+        );
 
-        let recent = &agg.snapshot().recent_violations[0];
-        assert_eq!(recent.pk, pk);
-        assert_eq!(recent.sk, Some(sk));
-        assert_eq!(recent.violation.category, ViolationCategory::TtlMissing);
+        let snap = agg.snapshot();
+        assert_eq!(snap.total_violations, 2);
+        let categories: Vec<_> = snap
+            .recent_violations
+            .iter()
+            .map(|recent| {
+                assert_eq!(recent.pk, pk);
+                assert_eq!(recent.sk.as_ref(), Some(&sk));
+                recent.violation.category
+            })
+            .collect();
+        assert_eq!(
+            categories,
+            [
+                ViolationCategory::TtlMissing,
+                ViolationCategory::TtlMalformed
+            ]
+        );
     }
 
     #[test]

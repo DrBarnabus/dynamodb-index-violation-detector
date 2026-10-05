@@ -249,9 +249,9 @@ fn fmt_eta(eta: Option<Duration>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AttributeValue, KeyAttribute};
-    use crate::rules::{Target, Violation, ViolationCategory};
+    use crate::rules::{Target, ViolationCategory};
     use crate::state::RecentViolation;
+    use crate::tui::recent_violation;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -311,22 +311,12 @@ mod tests {
     }
 
     fn recent(pk: &str) -> RecentViolation {
-        RecentViolation {
-            pk: KeyAttribute {
-                name: "id".to_string(),
-                value: AttributeValue::S(pk.to_string()),
-            },
-            sk: None,
-            violation: Violation {
-                target: Target::Ttl,
-                category: ViolationCategory::TtlMalformed,
-                attribute: Some("expiresAt".to_string()),
-                actual_value: None,
-                actual_type: None,
-                expected_type: None,
-                size_bytes: None,
-            },
-        }
+        recent_violation(
+            pk,
+            Target::Ttl,
+            ViolationCategory::TtlMalformed,
+            Some("expiresAt"),
+        )
     }
 
     #[test]
