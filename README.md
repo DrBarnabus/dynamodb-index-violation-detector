@@ -12,6 +12,18 @@ DynamoDB backfills it by scanning existing items; items whose proposed-key
 attributes are missing, of the wrong type, or over the index key size limits are
 silently not indexed. This tool reports those items up front.
 
+## Install
+
+Prebuilt binaries for Linux (x86_64 and arm64, statically linked against musl),
+macOS (Apple Silicon) and Windows (x86_64) are attached to each
+[GitHub Release](https://github.com/DrBarnabus/dynamodb-index-violation-detector/releases),
+alongside a `SHA256SUMS` file:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf dynamodb-violation-detector-<version>-<target>.tar.gz
+```
+
 ## Build
 
 Requires a stable Rust toolchain.
@@ -205,3 +217,17 @@ engine (`benches/rules.rs`) and the export writers (`benches/export.rs`), each
 over batches of 1,000 items. Criterion flags pass through after `--`: `--quick`
 for a fast run, or `--save-baseline <name>` and `--baseline <name>` to compare
 against an earlier run. Reports are written to `target/criterion/`.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then push a matching tag:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Pushing the tag runs CI, checks the tag against `Cargo.toml`, builds each target
+and drafts a release for you to review and publish; tags with a `-` suffix such
+as `v0.2.0-rc.1` become pre-releases. Running the workflow manually from the
+Actions tab only builds the archives.
