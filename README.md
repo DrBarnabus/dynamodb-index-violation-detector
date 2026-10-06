@@ -24,6 +24,20 @@ sha256sum --check --ignore-missing SHA256SUMS
 tar xzf dynamodb-violation-detector-<version>-<target>.tar.gz
 ```
 
+Each archive carries a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+proving it was built by this repository's release workflow:
+
+```sh
+gh attestation verify dynamodb-violation-detector-<version>-<target>.tar.gz \
+  --repo DrBarnabus/dynamodb-index-violation-detector
+```
+
+The binaries are not code-signed. On macOS, a file downloaded through a browser
+is quarantined by Gatekeeper; clear it with
+`xattr -d com.apple.quarantine dynamodb-violation-detector` (downloads via
+`curl` or `gh release download` are not quarantined). On Windows, SmartScreen
+may warn on first run; choose *More info* → *Run anyway*.
+
 ## Build
 
 Requires [rustup](https://rustup.rs), which installs the Rust version pinned in

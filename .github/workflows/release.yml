@@ -34,6 +34,10 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: version
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +64,9 @@ jobs:
           else
             tar czf "$name.tar.gz" "$name"
           fi
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.BIN }}-*.${{ matrix.archive }}
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
