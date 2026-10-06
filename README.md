@@ -26,7 +26,8 @@ tar xzf dynamodb-violation-detector-<version>-<target>.tar.gz
 
 ## Build
 
-Requires a stable Rust toolchain.
+Requires [rustup](https://rustup.rs), which installs the Rust version pinned in
+`rust-toolchain.toml`.
 
 ```sh
 cargo build --release
