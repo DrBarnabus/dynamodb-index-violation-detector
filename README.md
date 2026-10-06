@@ -233,3 +233,7 @@ Pushing the tag runs CI, checks the tag against `Cargo.toml`, builds each target
 and drafts a release for you to review and publish; tags with a `-` suffix such
 as `v0.2.0-rc.1` become pre-releases. Running the workflow manually from the
 Actions tab only builds the archives.
+
+## License
+
+[MIT](LICENSE)

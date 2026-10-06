@@ -54,7 +54,7 @@ jobs:
       - run: |
           name="$BIN-$GITHUB_REF_NAME-${{ matrix.target }}"
           mkdir "$name"
-          cp README.md "target/${{ matrix.target }}/release/$BIN${{ matrix.exe }}" "$name/"
+          cp README.md LICENSE "target/${{ matrix.target }}/release/$BIN${{ matrix.exe }}" "$name/"
           if [ "${{ matrix.archive }}" = zip ]; then
             7z a "$name.zip" "$name" > /dev/null
           else
