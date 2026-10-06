@@ -72,6 +72,7 @@ suggested fix.
 | `--region <REGION>` | AWS region |
 | `--segments <N>` | Parallel scan segment count (default: CPU count) |
 | `--rate-limit-percent <1..=100>` | Percentage of provisioned RCU to consume (unlimited if unset) |
+| `-V`, `--version` | Print the version and the git commit it was built from |
 
 CLI flags override TOML values, which override built-in defaults.
 

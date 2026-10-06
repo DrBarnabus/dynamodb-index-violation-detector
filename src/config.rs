@@ -43,8 +43,14 @@ pub struct ScanConfig {
 /// Command-line overrides. Every field is optional and, when set,
 /// takes precedence over the corresponding config-file value. The config file
 /// path itself is resolved by the caller and passed to [`load`] separately.
+/// Crate version plus the git commit it was built from (set by `build.rs`).
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 #[derive(Debug, Clone, Default, Parser)]
-#[command(about = "Detect DynamoDB items that violate a GSI/LSI key schema or TTL shape")]
+#[command(
+    version = VERSION,
+    about = "Detect DynamoDB items that violate a GSI/LSI key schema or TTL shape"
+)]
 pub struct CliArgs {
     /// Path to the TOML config file (default: ./scan.toml if present).
     #[arg(long)]
@@ -818,6 +824,18 @@ name = "dup"
     #[test]
     fn missing_table_everywhere_is_left_for_the_picker() {
         assert_eq!(merge(None, &cli()).unwrap().table, "");
+    }
+
+    #[test]
+    fn version_flag_reports_crate_version_and_commit() {
+        let err =
+            CliArgs::try_parse_from(["dynamodb-violation-detector", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            err.to_string().trim(),
+            format!("dynamodb-violation-detector {VERSION}")
+        );
+        assert!(!env!("GIT_COMMIT").is_empty());
     }
 
     #[test]
