@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
 /// Resolve configuration and discover profiles, then run the TUI. Failures
 /// before the TUI starts surface on stderr (see [`main`]); once the TUI owns the
 /// terminal, errors are shown as a modal instead.
-async fn run(cli: CliArgs) -> Result<(), ShellError> {
+async fn run(cli: CliArgs) -> Result<(), AppError> {
     let config_path = resolve_config_path(&cli);
     let config = config::load(config_path.as_deref(), &cli)?;
 
@@ -50,12 +50,12 @@ async fn run(cli: CliArgs) -> Result<(), ShellError> {
     let save_path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
     let shell = Shell::new(config, save_path, Box::new(AwsConnector));
 
-    let mut terminal = ratatui::try_init().map_err(ShellError::Io)?;
+    let mut terminal = ratatui::try_init().map_err(AppError::Io)?;
     let (input, input_shutdown) = spawn_input_reader();
     let result = shell.event_loop(&mut terminal, input, profiles).await;
     input_shutdown.store(true, Ordering::Relaxed);
     ratatui::restore();
-    result.map_err(ShellError::Io)
+    result.map_err(AppError::Io)
 }
 
 /// Which config file to read: an explicit `--config`, else `./scan.toml` when it
@@ -108,43 +108,44 @@ fn spawn_input_reader() -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
     (rx, shutdown)
 }
 
-/// A failure that occurs before the TUI takes over the terminal.
+/// A failure that ends the program: loading configuration or profiles, or
+/// driving the terminal.
 #[derive(Debug)]
-enum ShellError {
+enum AppError {
     Config(ConfigError),
     Profiles(ProfileError),
     Io(io::Error),
 }
 
-impl fmt::Display for ShellError {
+impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ShellError::Config(err) => write!(f, "{err}"),
-            ShellError::Profiles(err) => write!(f, "{err}"),
-            ShellError::Io(err) => write!(f, "{err}"),
+            AppError::Config(err) => write!(f, "{err}"),
+            AppError::Profiles(err) => write!(f, "{err}"),
+            AppError::Io(err) => write!(f, "{err}"),
         }
     }
 }
 
-impl std::error::Error for ShellError {
+impl std::error::Error for AppError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ShellError::Config(err) => Some(err),
-            ShellError::Profiles(err) => Some(err),
-            ShellError::Io(err) => Some(err),
+            AppError::Config(err) => Some(err),
+            AppError::Profiles(err) => Some(err),
+            AppError::Io(err) => Some(err),
         }
     }
 }
 
-impl From<ConfigError> for ShellError {
+impl From<ConfigError> for AppError {
     fn from(err: ConfigError) -> Self {
-        ShellError::Config(err)
+        AppError::Config(err)
     }
 }
 
-impl From<ProfileError> for ShellError {
+impl From<ProfileError> for AppError {
     fn from(err: ProfileError) -> Self {
-        ShellError::Profiles(err)
+        AppError::Profiles(err)
     }
 }
 

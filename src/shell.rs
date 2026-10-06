@@ -479,10 +479,15 @@ mod tests {
     /// How long a scripted session may run before the test fails as hung.
     const SESSION_LIMIT: Duration = Duration::from_secs(10);
 
+    /// How long a script waits for a frame to show what it expects; within
+    /// [`SESSION_LIMIT`] so a stuck wait reports its last frame.
+    const FRAME_WAIT: Duration = Duration::from_secs(5);
+
     type Connection = (Option<String>, Option<String>);
 
     /// Hands out one shared mock client and records each connection's profile
     /// and region.
+    #[derive(Clone)]
     struct MockConnector {
         client: Arc<MockDynamoClient>,
         connections: Arc<Mutex<Vec<Connection>>>,
@@ -507,6 +512,14 @@ mod tests {
     struct TestScreen {
         terminal: Terminal<TestBackend>,
         frames: watch::Sender<String>,
+    }
+
+    impl TestScreen {
+        fn new() -> (Self, watch::Receiver<String>) {
+            let (frames, receiver) = watch::channel(String::new());
+            let terminal = Terminal::new(TestBackend::new(120, 50)).unwrap();
+            (Self { terminal, frames }, receiver)
+        }
     }
 
     impl DrawTarget for TestScreen {
@@ -546,6 +559,14 @@ mod tests {
                 .expect("event loop stopped reading input");
         }
 
+        /// Start a scan from the setup screen and wait for it to complete.
+        async fn run_scan(&mut self) {
+            self.wait_for("Scan setup").await;
+            self.press(KeyCode::BackTab).await;
+            self.press(KeyCode::Enter).await;
+            self.wait_for("Scan complete").await;
+        }
+
         async fn wait_for(&mut self, text: &str) {
             self.wait_until(text, |frame| frame.contains(text)).await;
         }
@@ -556,7 +577,7 @@ mod tests {
 
         async fn wait_until(&mut self, text: &str, condition: impl FnMut(&String) -> bool) {
             let settled = matches!(
-                timeout(Duration::from_secs(5), self.frames.wait_for(condition)).await,
+                timeout(FRAME_WAIT, self.frames.wait_for(condition)).await,
                 Ok(Ok(_))
             );
             assert!(
@@ -569,17 +590,9 @@ mod tests {
 
     /// Run `shell` against `script`. The script returns its [`Ui`] so input
     /// stays open, so the session must end through the loop's own quit path.
-    async fn run_session(
-        shell: Shell,
-        profiles: Vec<Profile>,
-        script: impl AsyncFnOnce(Ui) -> Ui,
-    ) -> io::Result<()> {
+    async fn run_session(shell: Shell, profiles: Vec<Profile>, script: impl AsyncFnOnce(Ui) -> Ui) {
         let (keys, input) = mpsc::channel(64);
-        let (frames_tx, frames) = watch::channel(String::new());
-        let mut screen = TestScreen {
-            terminal: Terminal::new(TestBackend::new(120, 50)).unwrap(),
-            frames: frames_tx,
-        };
+        let (mut screen, frames) = TestScreen::new();
 
         let session = async {
             tokio::join!(
@@ -590,12 +603,11 @@ mod tests {
         let (result, _ui) = timeout(SESSION_LIMIT, session)
             .await
             .expect("event loop did not quit");
-        result
+        result.expect("event loop failed");
     }
 
     struct Fixture {
-        client: Arc<MockDynamoClient>,
-        connections: Arc<Mutex<Vec<Connection>>>,
+        connector: MockConnector,
         dir: PathBuf,
     }
 
@@ -609,18 +621,26 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
 
             Self {
-                client: Arc::new(client),
-                connections: Arc::default(),
+                connector: MockConnector {
+                    client: Arc::new(client),
+                    connections: Arc::default(),
+                },
                 dir,
             }
         }
 
+        /// Run `script` against a shell configured for `table`, starting on the
+        /// setup screen.
+        async fn run(&self, table: &str, script: impl AsyncFnOnce(Ui) -> Ui) {
+            run_session(self.shell(self.config(table)), Vec::new(), script).await;
+        }
+
         fn shell(&self, config: ScanConfig) -> Shell {
-            let connector = MockConnector {
-                client: Arc::clone(&self.client),
-                connections: Arc::clone(&self.connections),
-            };
-            Shell::new(config, self.save_path(), Box::new(connector))
+            Shell::new(config, self.save_path(), Box::new(self.connector.clone()))
+        }
+
+        fn client(&self) -> &MockDynamoClient {
+            &self.connector.client
         }
 
         fn save_path(&self) -> PathBuf {
@@ -651,7 +671,7 @@ mod tests {
         }
 
         fn connections(&self) -> Vec<Connection> {
-            self.connections.lock().unwrap().clone()
+            self.connector.connections.lock().unwrap().clone()
         }
     }
 
@@ -693,22 +713,26 @@ mod tests {
         user("u-1", AttributeValue::N("5".to_string()))
     }
 
+    /// A client listing `orders` and `users` that can describe `users`.
+    fn described_users() -> MockDynamoClient {
+        MockDynamoClient::new()
+            .with_tables(["orders", "users"])
+            .with_describe("users", users())
+    }
+
     /// One page holding a GSI type mismatch (`u-1`) and a clean item (`u-2`).
     fn scanned_users() -> MockDynamoClient {
-        MockDynamoClient::new()
-            .with_tables(["users"])
-            .with_describe("users", users())
-            .with_scan_pages(
-                0,
-                [Ok(ScanResponse {
-                    items: vec![
-                        violating_user(),
-                        user("u-2", AttributeValue::S("a@example.com".to_string())),
-                    ],
-                    last_evaluated_key: None,
-                    consumed_rcu: None,
-                })],
-            )
+        described_users().with_scan_pages(
+            0,
+            [Ok(ScanResponse {
+                items: vec![
+                    violating_user(),
+                    user("u-2", AttributeValue::S("a@example.com".to_string())),
+                ],
+                last_evaluated_key: None,
+                consumed_rcu: None,
+            })],
+        )
     }
 
     fn profile(name: &str, region: Option<&str>) -> Profile {
@@ -720,47 +744,33 @@ mod tests {
 
     #[tokio::test]
     async fn configured_table_opens_setup_with_its_schema() {
-        let fixture = Fixture::new(
-            "configured",
-            MockDynamoClient::new()
-                .with_tables(["orders", "users"])
-                .with_describe("users", users()),
-        );
+        let fixture = Fixture::new("configured", described_users());
 
-        let result = run_session(
-            fixture.shell(fixture.config("users")),
-            Vec::new(),
-            async |mut ui| {
+        fixture
+            .run("users", async |mut ui| {
                 ui.wait_for("Scan setup").await;
                 ui.wait_for("byEmail").await;
                 ui.press(KeyCode::Esc).await;
                 ui
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
         assert_eq!(
             fixture.connections(),
             vec![(None, Some("eu-west-1".to_string()))]
         );
-        assert_eq!(fixture.client.list_tables_call_count(), 1);
-        assert_eq!(fixture.client.recorded_describes(), vec!["users"]);
+        assert_eq!(fixture.client().list_tables_call_count(), 1);
+        assert_eq!(fixture.client().recorded_describes(), vec!["users"]);
     }
 
     #[tokio::test]
     async fn chosen_profile_connects_in_its_default_region() {
-        let fixture = Fixture::new(
-            "profile",
-            MockDynamoClient::new()
-                .with_tables(["users"])
-                .with_describe("users", users()),
-        );
+        let fixture = Fixture::new("profile", described_users());
         let mut config = fixture.config("users");
         config.region = None;
         let profiles = vec![profile("prod", None), profile("dev", Some("eu-west-2"))];
 
-        let result = run_session(fixture.shell(config), profiles, async |mut ui| {
+        run_session(fixture.shell(config), profiles, async |mut ui| {
             ui.wait_for("Choose AWS profile").await;
             ui.type_text("dev").await;
             ui.press(KeyCode::Enter).await;
@@ -770,7 +780,6 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
         assert_eq!(
             fixture.connections(),
             vec![(Some("dev".to_string()), Some("eu-west-2".to_string()))]
@@ -781,63 +790,42 @@ mod tests {
     async fn aws_error_modal_swallows_the_dismissing_key() {
         let fixture = Fixture::new("modal", MockDynamoClient::new().with_tables(["users"]));
 
-        let result = run_session(
-            fixture.shell(fixture.config("users")),
-            Vec::new(),
-            async |mut ui| {
+        fixture
+            .run("users", async |mut ui| {
                 ui.wait_for("AWS error").await;
                 ui.press(KeyCode::Esc).await;
                 ui.wait_for_absence("AWS error").await;
                 ui.wait_for("Scan setup").await;
                 ui.press(KeyCode::Esc).await;
                 ui
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn choosing_a_table_describes_it() {
-        let fixture = Fixture::new(
-            "choose-table",
-            MockDynamoClient::new()
-                .with_tables(["orders", "users"])
-                .with_describe("users", users()),
-        );
+        let fixture = Fixture::new("choose-table", described_users());
 
-        let result = run_session(
-            fixture.shell(fixture.config("")),
-            Vec::new(),
-            async |mut ui| {
+        fixture
+            .run("", async |mut ui| {
                 ui.wait_for("Scan setup").await;
                 ui.type_text("users").await;
                 ui.press(KeyCode::Enter).await;
                 ui.wait_for("byEmail").await;
                 ui.press(KeyCode::Esc).await;
                 ui
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
-        assert_eq!(fixture.client.recorded_describes(), vec!["users"]);
+        assert_eq!(fixture.client().recorded_describes(), vec!["users"]);
     }
 
     #[tokio::test]
     async fn leaving_an_edited_region_reconnects_there() {
-        let fixture = Fixture::new(
-            "region",
-            MockDynamoClient::new()
-                .with_tables(["users"])
-                .with_describe("users", users()),
-        );
+        let fixture = Fixture::new("region", described_users());
 
-        let result = run_session(
-            fixture.shell(fixture.config("users")),
-            Vec::new(),
-            async |mut ui| {
+        fixture
+            .run("users", async |mut ui| {
                 ui.wait_for("Scan setup").await;
                 ui.press(KeyCode::Tab).await;
                 for _ in "eu-west-1".chars() {
@@ -847,11 +835,9 @@ mod tests {
                 ui.press(KeyCode::Tab).await;
                 ui.press(KeyCode::Esc).await;
                 ui
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
         assert_eq!(
             fixture.connections(),
             vec![
@@ -859,31 +845,27 @@ mod tests {
                 (None, Some("us-east-1".to_string())),
             ]
         );
-        assert_eq!(fixture.client.list_tables_call_count(), 2);
-        assert_eq!(fixture.client.recorded_describes(), vec!["users", "users"]);
+        assert_eq!(fixture.client().list_tables_call_count(), 2);
+        assert_eq!(
+            fixture.client().recorded_describes(),
+            vec!["users", "users"]
+        );
     }
 
     #[tokio::test]
     async fn scan_runs_to_completion_and_exports_violations() {
         let fixture = Fixture::new("scan", scanned_users());
 
-        let result = run_session(
-            fixture.shell(fixture.config("users")),
-            Vec::new(),
-            async |mut ui| {
-                ui.wait_for("Scan setup").await;
-                ui.press(KeyCode::BackTab).await;
-                ui.press(KeyCode::Enter).await;
-                ui.wait_for("Scan complete").await;
+        fixture
+            .run("users", async |mut ui| {
+                ui.run_scan().await;
                 ui.wait_for("Recent violations (1)").await;
                 ui.press(KeyCode::Char('q')).await;
                 ui
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
-        assert_eq!(fixture.client.recorded_scans().len(), 1);
+        assert_eq!(fixture.client().recorded_scans().len(), 1);
         let csv = fs::read_to_string(fixture.csv_path()).unwrap();
         assert!(csv.contains("u-1"), "{csv}");
         assert!(!csv.contains("u-2"), "{csv}");
@@ -896,27 +878,20 @@ mod tests {
             scanned_users().with_get_item(Ok(Some(violating_user()))),
         );
 
-        let result = run_session(
-            fixture.shell(fixture.config("users")),
-            Vec::new(),
-            async |mut ui| {
-                ui.wait_for("Scan setup").await;
-                ui.press(KeyCode::BackTab).await;
-                ui.press(KeyCode::Enter).await;
-                ui.wait_for("Scan complete").await;
+        fixture
+            .run("users", async |mut ui| {
+                ui.run_scan().await;
                 ui.press(KeyCode::Enter).await;
                 ui.wait_for("Violation detail").await;
                 ui.press(KeyCode::Esc).await;
                 ui.wait_for_absence("Violation detail").await;
                 ui.press(KeyCode::Esc).await;
                 ui
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
         assert_eq!(
-            fixture.client.recorded_get_items(),
+            fixture.client().recorded_get_items(),
             vec![GetItemRequest {
                 table: "users".to_string(),
                 key: Item::from([("id".to_string(), AttributeValue::S("u-1".to_string()))]),
@@ -926,26 +901,17 @@ mod tests {
 
     #[tokio::test]
     async fn save_shortcut_writes_the_setup_form() {
-        let fixture = Fixture::new(
-            "save",
-            MockDynamoClient::new()
-                .with_tables(["users"])
-                .with_describe("users", users()),
-        );
+        let fixture = Fixture::new("save", described_users());
 
-        let result = run_session(
-            fixture.shell(fixture.config("users")),
-            Vec::new(),
-            async |mut ui| {
+        fixture
+            .run("users", async |mut ui| {
                 ui.wait_for("Scan setup").await;
                 ui.press_ctrl('s').await;
                 ui.press(KeyCode::Esc).await;
                 ui
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
         let saved = config::load(Some(&fixture.save_path()), &Default::default()).unwrap();
         assert_eq!(saved.table, "users");
         assert_eq!(saved.region.as_deref(), Some("eu-west-1"));
@@ -953,18 +919,9 @@ mod tests {
 
     #[tokio::test]
     async fn closed_input_ends_the_loop() {
-        let fixture = Fixture::new(
-            "closed",
-            MockDynamoClient::new()
-                .with_tables(["users"])
-                .with_describe("users", users()),
-        );
+        let fixture = Fixture::new("closed", described_users());
         let (keys, input) = mpsc::channel(1);
-        let (frames, _) = watch::channel(String::new());
-        let mut screen = TestScreen {
-            terminal: Terminal::new(TestBackend::new(120, 50)).unwrap(),
-            frames,
-        };
+        let (mut screen, _frames) = TestScreen::new();
         drop(keys);
 
         let shell = fixture.shell(fixture.config("users"));
